@@ -1,0 +1,15 @@
+# Hold up to 4 pieces and release them permuted; window also flushes after
+# 5ms since the first hold. Bytes are preserved exactly once.
+version: 1
+seed: 17
+listen: 127.0.0.1:17641
+upstream: 127.0.0.1:17640
+
+rules:
+  - name: scramble-s2c
+    when:
+      direction: server_to_client
+    inject:
+      reorder:
+        depth: 4
+        max_hold: 5ms

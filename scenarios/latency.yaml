@@ -1,0 +1,12 @@
+# Uniform 50ms one-way delay with +/-20ms jitter, both directions.
+version: 1
+seed: 11
+listen: 127.0.0.1:17621
+upstream: 127.0.0.1:17620
+
+rules:
+  - name: slow-network
+    inject:
+      latency:
+        mean: 50ms
+        jitter: 20ms

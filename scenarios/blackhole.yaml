@@ -1,0 +1,17 @@
+# Silence the client-to-server stream for 1 second: chunks are consumed and
+# dropped (TCP still ACKs into Loki), then traffic resumes normally.
+version: 1
+seed: 19
+listen: 127.0.0.1:17651
+upstream: 127.0.0.1:17650
+
+rules:
+  - name: outage
+    when:
+      direction: client_to_server
+      max_occurrences: 1
+    inject:
+      blackhole:
+        direction: client_to_server
+        mode: discard
+        duration: 1s

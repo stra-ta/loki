@@ -1,0 +1,11 @@
+# Terminate the connection with RST 5 seconds after it opens (both legs).
+version: 1
+seed: 23
+listen: 127.0.0.1:17661
+upstream: 127.0.0.1:17660
+
+rules:
+  - name: kill-after-5s
+    inject:
+      reset:
+        after: 5s

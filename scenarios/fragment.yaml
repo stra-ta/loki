@@ -1,0 +1,14 @@
+# Shred every client-to-server chunk into pieces of 1..8 bytes.
+version: 1
+seed: 7
+listen: 127.0.0.1:17611
+upstream: 127.0.0.1:17610
+
+rules:
+  - name: shred
+    when:
+      direction: client_to_server
+    inject:
+      fragment:
+        min: 1
+        max: 8

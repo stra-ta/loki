@@ -1,0 +1,12 @@
+# Cap throughput at 50 KiB/s per direction with an 8 KiB burst allowance.
+version: 1
+seed: 13
+listen: 127.0.0.1:17631
+upstream: 127.0.0.1:17630
+
+rules:
+  - name: narrow-pipe
+    inject:
+      bandwidth:
+        rate: 51200
+        burst: 8192

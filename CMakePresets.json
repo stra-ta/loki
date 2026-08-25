@@ -1,0 +1,28 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {"major": 3, "minor": 25, "patch": 0},
+  "configurePresets": [
+    {"name":"default","generator":"Unix Makefiles","binaryDir":"${sourceDir}/build/default","cacheVariables":{"CMAKE_BUILD_TYPE":"Debug"}},
+    {"name":"release","inherits":"default","binaryDir":"${sourceDir}/build/release","cacheVariables":{"CMAKE_BUILD_TYPE":"Release"}},
+    {"name":"debug","inherits":"default","binaryDir":"${sourceDir}/build/debug","cacheVariables":{"CMAKE_BUILD_TYPE":"Debug"}},
+    {"name":"asan","inherits":"debug","binaryDir":"${sourceDir}/build/asan","cacheVariables":{"CMAKE_CXX_FLAGS":"-fsanitize=address -fno-omit-frame-pointer","CMAKE_EXE_LINKER_FLAGS":"-fsanitize=address"}},
+    {"name":"ubsan","inherits":"debug","binaryDir":"${sourceDir}/build/ubsan","cacheVariables":{"CMAKE_CXX_FLAGS":"-fsanitize=undefined -fno-omit-frame-pointer","CMAKE_EXE_LINKER_FLAGS":"-fsanitize=undefined"}},
+    {"name":"tsan","inherits":"debug","binaryDir":"${sourceDir}/build/tsan","cacheVariables":{"CMAKE_CXX_FLAGS":"-fsanitize=thread","CMAKE_EXE_LINKER_FLAGS":"-fsanitize=thread"}}
+  ],
+  "buildPresets": [
+    {"name":"default","configurePreset":"default"},
+    {"name":"release","configurePreset":"release"},
+    {"name":"debug","configurePreset":"debug"},
+    {"name":"asan","configurePreset":"asan"},
+    {"name":"ubsan","configurePreset":"ubsan"},
+    {"name":"tsan","configurePreset":"tsan"}
+  ],
+  "testPresets": [
+    {"name":"default","configurePreset":"default","output":{"outputOnFailure":true}},
+    {"name":"release","configurePreset":"release","output":{"outputOnFailure":true}},
+    {"name":"debug","configurePreset":"debug","output":{"outputOnFailure":true}},
+    {"name":"asan","configurePreset":"asan","output":{"outputOnFailure":true}},
+    {"name":"ubsan","configurePreset":"ubsan","output":{"outputOnFailure":true}},
+    {"name":"tsan","configurePreset":"tsan","output":{"outputOnFailure":true}}
+  ]
+}

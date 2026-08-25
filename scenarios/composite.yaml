@@ -1,0 +1,50 @@
+# Several faults composed on one pipeline: rules evaluate in ascending index,
+# shape faults transform the piece list, timing stamps never accelerate traffic.
+version: 1
+seed: 42
+listen: 127.0.0.1:17671
+upstream: 127.0.0.1:17670
+
+limits:
+  pending_bytes_per_direction: 262144
+  max_connections: 64
+
+rules:
+  - name: early-reset-guard
+    when:
+      direction: client_to_server
+    ledger: counts
+    inject:
+      fragment:
+        min: 64
+        max: 512
+
+  - name: occasional-dup
+    when:
+      probability: 0.25
+      max_occurrences: 100
+    inject:
+      duplicate:
+        count: 2
+
+  - name: reorder-window
+    when:
+      direction: server_to_client
+    inject:
+      reorder:
+        depth: 3
+        max_hold: 2ms
+
+  - name: sluggish-link
+    when:
+      direction: client_to_server
+    inject:
+      latency:
+        mean: 5ms
+        jitter: 5ms
+
+  - name: capped-bandwidth
+    inject:
+      bandwidth:
+        rate: 1048576
+        burst: 65536

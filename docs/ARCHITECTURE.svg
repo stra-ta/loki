@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="580" viewBox="0 0 1280 580" preserveAspectRatio="xMidYMin meet" role="img" aria-labelledby="title desc">
+  <title id="title">Loki data path</title>
+  <desc id="desc">A client connects to Loki's downstream leg. The reactor hands each read chunk to the fault engine, which applies scenario rules and returns pieces with send deadlines. A deadline heap releases deferred pieces, and the far leg writes them upstream to the server. Evidence writers and a control socket hang off the same single-threaded loop.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4f5bb5"/>
+    </marker>
+    <style>
+      .canvas { fill: #f7f8fc; }
+      .title { fill: #20242e; font: 700 29px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .subtitle { fill: #69727a; font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .group { fill: #f0eee9; stroke: #c9cde0; stroke-width: 1.5; rx: 16; }
+      .group-title { fill: #69727a; font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: .12em; text-transform: uppercase; }
+      .node rect { fill: #ffffff; stroke: #2e3942; stroke-width: 2; rx: 12; }
+      .node .label { fill: #20242e; font: 700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
+      .node .detail { fill: #69727a; font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
+      .node .number { fill: #4f5bb5; font: 700 13px ui-monospace, SFMono-Regular, Menlo, monospace; text-anchor: middle; }
+      .flow { stroke: #4f5bb5; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .flow-label { fill: #4f5bb5; font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
+    </style>
+  </defs>
+  <rect class="canvas" x="0" y="0" width="1280" height="580" rx="0"/>
+  <text class="title" x="64" y="72">Loki data path</text>
+  <text class="subtitle" x="64" y="98">One accepted connection maps to one upstream connection; every direction flows through one fault pipeline.</text>
+
+  <!-- peers -->
+  <g class="node">
+    <rect x="64" y="200" width="150" height="88"/>
+    <text class="number" x="139" y="226">01</text>
+    <text class="label" x="139" y="252">Client</text>
+    <text class="detail" x="139" y="272">downstream peer</text>
+  </g>
+  <g class="node">
+    <rect x="1066" y="200" width="150" height="88"/>
+    <text class="number" x="1141" y="226">06</text>
+    <text class="label" x="1141" y="252">Server</text>
+    <text class="detail" x="1141" y="272">upstream peer</text>
+  </g>
+
+  <!-- loki group -->
+  <rect class="group" x="270" y="140" width="740" height="360"/>
+  <text class="group-title" x="302" y="172">Loki · single I/O thread</text>
+
+  <g class="node">
+    <rect x="300" y="196" width="180" height="96"/>
+    <text class="number" x="390" y="222">02</text>
+    <text class="label" x="390" y="246">Reactor</text>
+    <text class="detail" x="390" y="266">kqueue / epoll event loop,</text>
+    <text class="detail" x="390" y="282">bounded pending queues</text>
+  </g>
+  <g class="node">
+    <rect x="550" y="196" width="180" height="96"/>
+    <text class="number" x="640" y="222">03</text>
+    <text class="label" x="640" y="246">Fault engine</text>
+    <text class="detail" x="640" y="266">rules in ascending index;</text>
+    <text class="detail" x="640" y="282">pieces with send deadlines</text>
+  </g>
+  <g class="node">
+    <rect x="800" y="196" width="180" height="96"/>
+    <text class="number" x="890" y="222">04</text>
+    <text class="label" x="890" y="246">Scheduler</text>
+    <text class="detail" x="890" y="266">deadline heap ordered by</text>
+    <text class="detail" x="890" y="282">(deadline_us, seq)</text>
+  </g>
+  <g class="node">
+    <rect x="550" y="368" width="180" height="88"/>
+    <text class="number" x="640" y="394">05</text>
+    <text class="label" x="640" y="420">Evidence store</text>
+    <text class="detail" x="640" y="442">ledger + run artifacts</text>
+  </g>
+
+  <!-- flows -->
+  <path class="flow" d="M 214 244 L 296 244"/>
+  <path class="flow" d="M 480 244 L 546 244"/>
+  <path class="flow" d="M 730 260 L 796 260"/>
+  <path class="flow" d="M 980 244 L 1062 244"/>
+  <path class="flow" d="M 890 296 L 890 340 L 728 412"/>
+
+  <text class="flow-label" x="255" y="232">read chunks</text>
+  <text class="flow-label" x="514" y="232">pieces</text>
+  <text class="flow-label" x="763" y="224">
+    <tspan x="763" dy="0">deliver at</tspan>
+    <tspan x="763" dy="14">deadline</tspan>
+  </text>
+  <text class="flow-label" x="1021" y="232">write</text>
+  <text class="flow-label" x="814" y="330">decisions recorded</text>
+
+  <text class="subtitle" x="302" y="482">Control socket shares the poll set: pause, resume, and manual injections enter as ledger events.</text>
+</svg>

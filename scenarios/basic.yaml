@@ -1,0 +1,6 @@
+# Minimal passthrough: no rules, pristine proxying. The control case every
+# fault scenario is measured against.
+version: 1
+seed: 1
+listen: 127.0.0.1:17601
+upstream: 127.0.0.1:17600
