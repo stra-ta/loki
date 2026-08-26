@@ -209,6 +209,35 @@ void Reactor::disarm_read(ConnState& c, Dir d) {
 
 void Reactor::enqueue_piece(ConnState& c, Dir d, OutPiece piece, TimeUs now) {
   DirectionState& ds = dir_of(c, d);
+
+  // Common path: an immediate piece with no older bytes can go straight to
+  // the established far socket. This avoids constructing an OutBlob and a
+  // second vector ownership transition for the usual passthrough case.
+  const int fd = far_fd(c, d);
+  if (ds.out.empty() && !piece.payload.empty() && fd >= 0 && !c.connecting) {
+    const std::size_t size = piece.payload.size();
+    const sock::IoResult w = sock::write_some(fd, piece.payload.data(), size);
+    if (w.n == static_cast<long>(size)) {
+      mutator_->on_data_flushed(StreamKey{c.conn, d}, size, now);
+      flush_direction(c, d, now);  // backpressure release and teardown checks
+      return;
+    }
+    if (w.n > 0) {
+      const std::size_t sent = static_cast<std::size_t>(w.n);
+      mutator_->on_data_flushed(StreamKey{c.conn, d}, sent, now);
+      OutBlob blob;
+      blob.logical_offset = piece.logical_offset;
+      blob.payload = std::move(piece.payload);
+      blob.sent = sent;
+      ds.pending_bytes += blob.payload.size() - sent;
+      ds.out.push_back(std::move(blob));
+      flush_direction(c, d, now);
+      return;
+    }
+    // EAGAIN and hard errors fall through to the existing queue path. The
+    // latter keeps the current lifecycle behavior for a subsequent event.
+  }
+
   OutBlob blob;
   blob.logical_offset = piece.logical_offset;
   blob.payload = std::move(piece.payload);
@@ -561,7 +590,7 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
       if (it == conns_.end()) return;
       ConnState& c = it->second;
       c.up_fd = sock::tcp_connect(config.scenario.upstream);
-           c.connecting = true;
+      c.connecting = true;
       (void)poller_->add(c.up_fd, leg_token(LegSide::Up, c.conn).raw(), PWrite);
       return;
     }
@@ -656,7 +685,7 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
        if (t.kind == FdKind::Upstream && c.connecting) {
          if ((ev.events & PWrite) != 0 || ev.err || ev.hup) {
            // Connect completion path.
-                    if (sock::connect_error(c.up_fd) == 0 && !ev.err) {
+            if (sock::connect_error(c.up_fd) == 0 && !ev.err) {
               c.connecting = false;
               c.established = true;
               dir_of(c, Dir::BtoA).read_armed = true;

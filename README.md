@@ -53,16 +53,16 @@ A note on naming honesty: Loki operates on application byte streams, not packets
 
 ## Measured snapshot
 
-Loopback TCP against a Python echo server, Apple M1, Apple Clang 21.0.0, kqueue backend, uncommitted working tree at measurement time. Full methodology and raw rounds in [docs/BENCHMARKS.md](docs/BENCHMARKS.md); harness is [`scripts/bench.py`](scripts/bench.py).
+Loopback TCP against a Python echo server, Apple M1, Apple Clang 21.0.0, kqueue backend, `RelWithDebInfo`, uncommitted working tree at measurement time. Full methodology and raw rounds in [docs/BENCHMARKS.md](docs/BENCHMARKS.md); harness is [`scripts/bench.py`](scripts/bench.py).
 
 | case | configured | measured |
 | --- | --- | --- |
-| Passthrough, direct client-server | - | 2100 MB/s median |
-| Passthrough through Loki, no rules | - | 63 MB/s median |
-| Latency fault RTT (50 ms ± 20 ms per direction) | nominal 100 ms, bounds [60, 180] ms | median 107.2 ms, range [71.8, 139.7] ms |
+| Passthrough, direct client-server | - | 978 MB/s median |
+| Passthrough through Loki, no rules | - | 398 MB/s median |
+| Latency fault RTT (50 ms ± 20 ms per direction) | nominal 100 ms, bounds [60, 180] ms | median 107.2 ms, range [71.5, 139.6] ms |
 | Bandwidth fault (50 KiB/s rate, 8 KiB burst) | 50 KiB/s sustained | 50 KiB/s achieved |
 
-The throughput gap is the cost of the determinism contract on a single I/O thread: every chunk crosses the mutator and the decision-ledger path. The fault rows are the accuracy that matters - configured rates and delays hold.
+The throughput gap is the cost of the deterministic single-threaded path: every chunk crosses the mutator and delivery machinery. The fault rows are the accuracy that matters - configured rates and delays hold.
 
 ## Usage
 
@@ -135,6 +135,13 @@ tests/<area>/    per-area Catch2 binaries
 ```
 
 AGENTS.md is the engineering guide: invariants, scenario schema, package boundaries, and glossary.
+
+## Documentation
+
+- [Benchmarks](docs/BENCHMARKS.md) - reproducible throughput and fault-accuracy measurements
+- [Roadmap](docs/ROADMAP.md) - performance, UDP, TLS, and protocol-aware faulting phases
+- [Architecture diagram](docs/ARCHITECTURE.svg) - reactor, mutator, scheduler, and evidence data path
+- [Evidence lifecycle](docs/EVIDENCE.svg) - recorded decisions, artifacts, and ledger replay
 
 ## Limitations
 

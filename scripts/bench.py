@@ -13,7 +13,7 @@ Measures, against a local Python echo server over loopback TCP:
    transfer; reports achieved KiB/s.
 
 Usage: python3 scripts/bench.py [path-to-loki-binary]
-Requires the default-preset build. Writes nothing into the repository.
+Requires the default-preset RelWithDebInfo build. Writes nothing into the repository.
 """
 
 import os
@@ -33,6 +33,7 @@ THROUGHPUT_BYTES = 128 * 1024 * 1024
 WARMUP_BYTES = 8 * 1024 * 1024
 RTT_ROUNDS = 60
 THROTTLE_BYTES = 256 * 1024
+THROUGHPUT_ROUNDS = 5
 
 
 def echo_server():
@@ -116,15 +117,20 @@ def throughput_case(upstream_port, listen_port=None, size=THROUGHPUT_BYTES):
 
 
 def main():
+    print(f"binary                : {LOKI}")
     up = echo_server()
 
-    direct = sorted(throughput_case(up) for _ in range(3))
-
-    lp = free_port()
-    proc = run_loki(f"version: 1\nseed: 1\nlisten: 127.0.0.1:{lp}\n"
-                    f"upstream: 127.0.0.1:{up}\n")
-    proxied = sorted(throughput_case(up, lp) for _ in range(3))
-    proc.terminate(); proc.wait()
+    direct = []
+    proxied = []
+    for _ in range(THROUGHPUT_ROUNDS):
+        direct.append(throughput_case(up))
+        lp = free_port()
+        proc = run_loki(f"version: 1\nseed: 1\nlisten: 127.0.0.1:{lp}\n"
+                        f"upstream: 127.0.0.1:{up}\n")
+        proxied.append(throughput_case(up, lp))
+        proc.terminate(); proc.wait()
+    direct.sort()
+    proxied.sort()
 
     lat_p = free_port()
     proc = run_loki(f"version: 1\nseed: 11\nlisten: 127.0.0.1:{lat_p}\n"

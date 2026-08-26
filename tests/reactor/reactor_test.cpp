@@ -5,6 +5,7 @@
 #include <loki/reactor.hpp>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -195,8 +196,18 @@ TEST_CASE("reactor passes 64 KiB through end to end", "[reactor]") {
   // Client through the proxy once the listener accepts.
   int cfd = -1;
   for (int i = 0; i < 500 && cfd < 0; ++i) {
-    cfd = sock::tcp_connect(listen_ep);
-    if (cfd < 0) usleep(10000);
+    const int candidate = sock::tcp_connect(listen_ep);
+    if (candidate >= 0) {
+      struct pollfd pfd{candidate, POLLOUT, 0};
+      const int ready = ::poll(&pfd, 1, 20);
+      if (ready > 0 && (pfd.revents & POLLOUT) != 0 &&
+          sock::connect_error(candidate) == 0) {
+        cfd = candidate;
+        break;
+      }
+      ::close(candidate);
+    }
+    usleep(10000);
   }
   REQUIRE(cfd >= 0);
 
