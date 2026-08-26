@@ -327,9 +327,9 @@ ParsedFault parse_inject(const YNode& inject) {
 MatchSpec parse_when(const YNode& when) {
   expect_map(when, "when");
   allow_keys(when,
-             {"direction", "after", "every_bytes", "every_events", "connection",
-              "probability", "max_occurrences", "min_stream_offset"},
-             "when");
+              {"direction", "after", "every_bytes", "every_events", "connection",
+               "probability", "max_occurrences", "min_stream_offset", "sni"},
+              "when");
   MatchSpec m;
   if (const YNode* n = when.find("direction")) {
     expect_scalar(*n, "when.direction");
@@ -358,6 +358,10 @@ MatchSpec parse_when(const YNode& when) {
   }
   if (const YNode* n = when.find("max_occurrences")) m.max_occurrences = as_uint(*n, "when.max_occurrences");
   if (const YNode* n = when.find("min_stream_offset")) m.min_stream_offset = as_uint(*n, "when.min_stream_offset");
+  if (const YNode* n = when.find("sni")) {
+    expect_scalar(*n, "when.sni");
+    m.sni = n->scalar;
+  }
   return m;
 }
 
@@ -542,6 +546,7 @@ Value when_json(const MatchSpec& w) {
     m.emplace_back("max_occurrences", Value::u(w.max_occurrences));
   }
   if (w.min_stream_offset != 0) m.emplace_back("min_stream_offset", Value::u(w.min_stream_offset));
+  if (!w.sni.empty()) m.emplace_back("sni", Value::str(w.sni));
   return sorted_object(std::move(m));
 }
 
@@ -649,6 +654,17 @@ CompiledScenario compile_scenario(const std::string& yaml_text) {
       ParsedFault f = parse_inject(*inject);
       cr.kind = f.kind;
       cr.params = f.params;
+
+      // SNI is only observable after the ClientHello is read (data phase).
+      // Connection/accept-phase faults act before any SNI exists, so combining
+      // them with when.sni yields an unreachable rule. Reject explicitly.
+      if (!cr.when.sni.empty() &&
+          (cr.kind == FaultKind::ConnectDelay || cr.kind == FaultKind::Refuse ||
+           cr.kind == FaultKind::AcceptStall)) {
+        err("when.sni cannot be combined with connection-phase faults "
+            "(connect_delay, refuse, accept_stall)",
+            rn.line);
+      }
 
       // Track explicit-vs-default name so normalized_json can omit defaults:
       // normalized_json derives this itself by comparing against "rule-N", so

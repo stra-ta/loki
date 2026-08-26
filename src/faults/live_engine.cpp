@@ -140,6 +140,10 @@ class LiveEngine final : public INetworkMutator {
       if (elapsed < m.after_us) continue;
       if (chunk_logical_offset < m.min_stream_offset) continue;
       if (m.connection.every > 0 && key.conn % m.connection.every != m.connection.equals) continue;
+      if (!m.sni.empty()) {
+        auto it = sni_.find(key.conn);
+        if (it == sni_.end() || it->second != m.sni) continue;
+      }
 
       bool crossed_bytes = true;
       if (m.every_bytes > 0) {
@@ -208,6 +212,10 @@ class LiveEngine final : public INetworkMutator {
       if (m.direction && *m.direction != Dir::AtoB) continue;
       if (elapsed < m.after_us) continue;
       if (m.connection.every > 0 && conn % m.connection.every != m.connection.equals) continue;
+      if (!m.sni.empty()) {
+        auto it = sni_.find(conn);
+        if (it == sni_.end() || it->second != m.sni) continue;
+      }
       if (rt.occurrences >= m.max_occurrences) continue;
       if (rng_.next_double() >= m.probability) continue;
       ++rt.occurrences;
@@ -252,6 +260,10 @@ class LiveEngine final : public INetworkMutator {
 
   void on_connection_established(ConnId, TimeUs) override {}
 
+  void on_connection_sni(ConnId conn, std::string sni, TimeUs) override {
+    sni_[conn] = std::move(sni);
+  }
+
   void on_connection_closed(ConnId conn, TimeUs, ClosedReason) override {
     sched_->drop_connection(conn);
     for (int dd = 0; dd < 2; ++dd) {
@@ -265,6 +277,7 @@ class LiveEngine final : public INetworkMutator {
     }
     idle_deadline_.erase(conn);
     idle_timer_live_.erase(conn);
+    sni_.erase(conn);
   }
 
   void on_data_flushed(const StreamKey& key, std::uint64_t, TimeUs now) override {
@@ -786,6 +799,7 @@ class LiveEngine final : public INetworkMutator {
   std::map<BKey, Bucket> buckets_;
   std::map<ConnId, IdleArm> idle_deadline_;
   std::map<ConnId, bool> idle_timer_live_;
+  std::map<ConnId, std::string> sni_;
 
   TimeUs stall_until_us_ = ~static_cast<TimeUs>(0);  // accept_stall window
   bool paused_ = false;                              // manual Pause

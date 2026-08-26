@@ -126,6 +126,9 @@ json::Value udp_connection_record(ConnId conn, const std::string& peer,
   rec.set("reason", json::Value::str(closed_reason_name(reason)));
   rec.set("bytes_a_to_b", json::Value::u(bytes_a_to_b));
   rec.set("bytes_b_to_a", json::Value::u(bytes_b_to_a));
+  // UDP is datagram-based and carries no TLS ClientHello, so SNI is always
+  // unknown; emit the field for schema consistency with the TCP reactor.
+  rec.set("sni", json::Value::str(std::string{}));
   return rec;
 }
 

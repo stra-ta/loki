@@ -55,6 +55,12 @@ rules:                           # optional list
       probability: <float>       # 0..1
       max_occurrences: <uint>
       min_stream_offset: <uint>
+      sni: <str>              # TLS-aware tunneling only: match the SNI extracted
+                              # from the connection's TLS ClientHello. Empty = any.
+                              # Only observable in the data phase; cannot be combined
+                              # with connection-phase faults (connect_delay, refuse,
+                              # accept_stall), which are rejected at compile time.
+                              # UDP has no ClientHello, so when.sni never matches there.
     ledger: full|counts|sample:N # optional, default full
     inject:                      # required; EXACTLY ONE key from below
       latency: {mean: <dur>, jitter: <dur>?}          # uniform +/- jitter

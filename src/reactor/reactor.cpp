@@ -29,6 +29,7 @@
 #include <limits>
 #include <map>
 #include <utility>
+#include <vector>
 
 #include <loki/control.hpp>
 #include <loki/evidence.hpp>
@@ -39,6 +40,7 @@
 
 #include "../config/validate_transport.hpp"
 #include "../transport/socket_util.hpp"
+#include "../transport/tls_client_hello.hpp"
 
 #ifdef LOKI_GIT_SHA
 #define LOKI_SHA LOKI_GIT_SHA
@@ -94,6 +96,14 @@ struct ConnState {
   bool established = false;
   bool downstream_eof_pending = false;  // client FIN seen before upstream ready
   DirectionState dir[2];                // indexed by Dir: [AtoB, BtoA]
+
+  // TLS-aware tunneling: SNI is extracted from the client's ClientHello by
+  // inspecting (not decrypting) the A->B byte stream. `sni_done` marks that the
+  // ClientHello decision is settled (found / absent / not-TLS); `sni_stage`
+  // buffers bytes until the parser can decide; `sni` holds the result.
+  bool sni_done = false;
+  std::vector<std::byte> sni_stage;
+  std::string sni;
 };
 
 Dir inbound_dir(LegSide s) { return s == LegSide::Down ? Dir::AtoB : Dir::BtoA; }
@@ -117,7 +127,8 @@ Token leg_token(LegSide s, ConnId conn) {
 json::Value connection_record(ConnId conn, const std::string& peer,
                               WallUs opened_at, ClosedReason reason,
                               std::uint64_t bytes_a_to_b,
-                              std::uint64_t bytes_b_to_a) {
+                              std::uint64_t bytes_b_to_a,
+                              const std::string& sni) {
   json::Value rec = json::Value::object();
   rec.set("connection", json::Value::u(conn));
   rec.set("peer", json::Value::str(peer));
@@ -127,6 +138,7 @@ json::Value connection_record(ConnId conn, const std::string& peer,
   rec.set("reason", json::Value::str(closed_reason_name(reason)));
   rec.set("bytes_a_to_b", json::Value::u(bytes_a_to_b));
   rec.set("bytes_b_to_a", json::Value::u(bytes_b_to_a));
+  rec.set("sni", json::Value::str(sni));
   return rec;
 }
 
@@ -343,6 +355,29 @@ void Reactor::read_leg(ConnState& c, Dir d, TimeUs now) {
       return;
     }
      const std::size_t n = static_cast<std::size_t>(r.n);
+     // TLS-aware tunneling: inspect (never decrypt) the client's ClientHello to
+     // extract SNI so fault rules can match `when.sni`. Buffered until the
+     // parser can decide; the bytes are still forwarded verbatim below.
+     if (d == Dir::AtoB && !c.sni_done) {
+       const std::byte* base = reinterpret_cast<const std::byte*>(buf);
+       c.sni_stage.insert(c.sni_stage.end(), base, base + n);
+       std::string extracted;
+       const loki::tls::ClientHelloStatus st = loki::tls::parse_client_hello_sni(
+           std::span<const std::byte>(c.sni_stage.data(), c.sni_stage.size()),
+           extracted);
+        if (st == loki::tls::ClientHelloStatus::Found) {
+          c.sni = std::move(extracted);
+          c.sni_done = true;
+          mutator_->on_connection_sni(c.conn, c.sni, now);
+        } else if (st == loki::tls::ClientHelloStatus::Incomplete) {
+          // Need more bytes; stop buffering if we've staged an unreasonable
+          // amount (defensive; real ClientHellos are a few hundred bytes).
+          if (c.sni_stage.size() > (std::size_t{1} << 16)) c.sni_done = true;
+        } else {
+          // NotTls or NoSni: no usable SNI for this connection.
+          c.sni_done = true;
+        }
+     }
      // Offset invariant: offset of this chunk's first pristine byte.
     const StreamStats stats_before = ds.stats;  // passed BY VALUE
     ProcessResult pr = mutator_->process_read(
@@ -414,7 +449,7 @@ bool Reactor::graceful_teardown_if_done(ConnState& c, TimeUs now) {
   sched_->drop_connection(c.conn);
   store_->log_connection(connection_record(
       c.conn, c.peer, c.opened_at, reason, c.dir[0].stats.bytes_seen,
-      c.dir[1].stats.bytes_seen));
+      c.dir[1].stats.bytes_seen, c.sni));
   mutator_->on_connection_closed(c.conn, now, reason);
   conns_.erase(c.conn);
   return true;
@@ -435,7 +470,7 @@ void Reactor::rst_teardown(ConnState& c, ClosedReason reason, TimeUs now) {
   sched_->drop_connection(c.conn);
   store_->log_connection(connection_record(
       c.conn, c.peer, c.opened_at, reason, c.dir[0].stats.bytes_seen,
-      c.dir[1].stats.bytes_seen));
+      c.dir[1].stats.bytes_seen, c.sni));
   mutator_->on_connection_closed(c.conn, now, reason);
   conns_.erase(c.conn);
 }
@@ -607,8 +642,8 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
       }
       sched_->drop_connection(a->conn);
       store_->log_connection(connection_record(a->conn, c.peer, c.opened_at,
-                                               ClosedReason::ConnectFailed, 0,
-                                               0));
+                                               ClosedReason::ConnectFailed, 0, 0,
+                                               c.sni));
       mutator_->on_connection_closed(a->conn, now, ClosedReason::ConnectFailed);
       conns_.erase(a->conn);
       return;

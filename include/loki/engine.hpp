@@ -91,6 +91,15 @@ class INetworkMutator {
   virtual void on_connection_established(ConnId conn, TimeUs now) = 0;
   virtual void on_connection_closed(ConnId conn, TimeUs now, ClosedReason reason) = 0;
 
+  // Reports the TLS SNI extracted from a connection's ClientHello in TLS-aware
+  // tunneling mode (no decryption). Engines may use it for `when.sni` matching.
+  // Default no-op so existing mutators need not implement it.
+  virtual void on_connection_sni(ConnId conn, std::string sni, TimeUs now) {
+    (void)conn;
+    (void)sni;
+    (void)now;
+  }
+
   // Bytes actually hit the wire on the far leg (used by token bucket).
   virtual void on_data_flushed(const StreamKey& key, std::uint64_t bytes, TimeUs now) = 0;
 

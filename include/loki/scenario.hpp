@@ -157,6 +157,7 @@ struct MatchSpec {
   double probability = 1.0;          // [0,1]
   std::uint64_t max_occurrences = ~std::uint64_t{0};
   std::uint64_t min_stream_offset = 0;  // stream_offset >= guard
+  std::string sni;                   // TLS SNI (server_name) exact match; "" = any
 };
 
 // ---------------------------------------------------------------------------
