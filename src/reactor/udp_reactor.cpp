@@ -35,6 +35,7 @@
 #include <loki/scheduler.hpp>
 #include <loki/version.hpp>
 
+#include "../config/validate_transport.hpp"
 #include "../transport/socket_util.hpp"
 
 #ifdef LOKI_GIT_SHA
@@ -237,8 +238,15 @@ ConnId UdpReactor::create_conn(const sockaddr_storage& from, socklen_t flen,
   poller_->add(ref.up_fd, up_token(conn).raw(), PRead);
   sync_up_events(ref);
   ++summary_.connections_total;
-  mutator_->on_connection_accepted(conn, now);
-  mutator_->on_connection_established(conn, now);
+  try {
+    mutator_->on_connection_accepted(conn, now);
+    mutator_->on_connection_established(conn, now);
+  } catch (...) {
+    // A throwing mutator callback must not leak the upstream fd; tear the
+    // mapping down (which closes up_fd) before propagating.
+    teardown_conn(conn, ClosedReason::ClientClosed, now);
+    throw;
+  }
   return conn;
 }
 
@@ -322,10 +330,17 @@ void UdpReactor::enqueue_piece(UdpConn& c, Dir d, OutPiece piece, TimeUs now) {
   UdpDirState& ds = c.dir[static_cast<int>(d)];
   const int send_fd = (d == Dir::AtoB) ? c.up_fd : down_fd_;
   if (send_fd < 0) return;  // no far socket; drop
-  // Zero-length datagrams are legal UDP and must round-trip transparently.
+  // Zero-length datagrams are legal UDP and must round-trip transparently. A
+  // would_block (rare for a 0-byte send) is retried via the writable path.
   if (piece.payload.empty()) {
     sock::IoResult w = send_bytes(send_fd, d, c, "", 0);
-    (void)w;
+    if (w.would_block) {
+      UdpOutBlob blob;
+      blob.logical_offset = piece.logical_offset;
+      ds.out.push_back(std::move(blob));
+      flush_direction(c, d, now);
+      return;
+    }
     flush_direction(c, d, now);
     return;
   }
@@ -562,10 +577,11 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
   const int down_fd = sock::udp_bind(config.scenario.listen);
   down_fd_ = down_fd;
 
-  // RAII cleanup guard: guarantees the listener fd, the signal self-pipe, the
-  // global signal write fd, and the installed signal dispositions are released
-  // even if a later setup step throws. Closing an fd removes it from the poller
-  // on both kqueue and epoll, so the explicit poller_->del calls are optional.
+  // RAII cleanup guard: guarantees the listener fd, every live upstream fd, the
+  // signal self-pipe, the global signal write fd, and the installed signal
+  // dispositions are released even if a later step throws. Closing an fd removes
+  // it from the poller on both kqueue and epoll, so explicit poller_->del calls
+  // are optional.
   int sig_read_fd = -1;
   int sig_write_fd = -1;
   struct sigaction old_int {};
@@ -578,7 +594,14 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
     struct sigaction& old_int;
     struct sigaction& old_term;
     bool& installed;
+    std::map<ConnId, UdpConn>& conns;
     ~Cleanup() {
+      for (auto& entry : conns) {
+        if (entry.second.up_fd >= 0) {
+          ::close(entry.second.up_fd);
+          entry.second.up_fd = -1;
+        }
+      }
       if (down_fd >= 0) { ::close(down_fd); down_fd = -1; }
       if (sig_read >= 0) { ::close(sig_read); sig_read = -1; }
       if (sig_write >= 0) { ::close(sig_write); sig_write = -1; }
@@ -590,7 +613,7 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
     }
   };
   Cleanup cleanup_guard{down_fd_, sig_read_fd, sig_write_fd, old_int, old_term,
-                        sig_installed};
+                        sig_installed, conns_};
 
   ManifestInfo info;
   info.loki_version = LOKI_VERSION_STRING;
@@ -775,6 +798,7 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
 }
 
 ReactorSummary run_proxy_udp(const ReactorConfig& config, MutatorFactory factory) {
+  check_transport_compat(config.scenario, TransportMode::Udp);
   ::signal(SIGPIPE, SIG_IGN);
   UdpReactor r;
   return r.run(config, factory);
