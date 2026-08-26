@@ -20,6 +20,18 @@ void check_transport_compat(const CompiledScenario& sc, TransportMode t) {
             "rule '" + r.name + "' uses fault '" + std::string(kind_name(r.kind)) +
                 "' which is unsupported for UDP transport",
             0);
+      case FaultKind::Blackhole: {
+        const auto& bh = std::get<BlackholeParams>(r.params);
+        if (bh.mode == BlackholeParams::Mode::Freeze) {
+          throw ScenarioError(
+              "rule '" + r.name +
+                  "' uses blackhole mode 'freeze' which is unsupported for UDP "
+                  "transport (the shared listener cannot stop reading a single "
+                  "client); use mode 'discard' instead",
+              0);
+        }
+        break;
+      }
       default:
         break;
     }

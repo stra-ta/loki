@@ -37,6 +37,7 @@
 #include <loki/scheduler.hpp>
 #include <loki/version.hpp>
 
+#include "../config/validate_transport.hpp"
 #include "../transport/socket_util.hpp"
 
 #ifdef LOKI_GIT_SHA
@@ -812,6 +813,9 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
 }
 
 ReactorSummary run_proxy(const ReactorConfig& config, MutatorFactory factory) {
+  // Transport compatibility is enforced at the public entry point so that direct
+  // API callers cannot run TCP-only faults through UDP either.
+  check_transport_compat(config.scenario, config.transport);
   // Writes race peer closes constantly in a proxy; EPIPE must surface as a
   // write error, not a process kill.
   ::signal(SIGPIPE, SIG_IGN);

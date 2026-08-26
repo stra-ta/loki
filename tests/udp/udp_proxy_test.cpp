@@ -17,10 +17,11 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <span>
 #include <string>
 #include <thread>
-#include <vector>
 
 #include "../src/transport/socket_util.hpp"
 
@@ -28,12 +29,14 @@ using namespace loki;
 
 namespace {
 
-// UDP echo server: bounces every datagram back to its sender.
+// UDP echo server: bounces every datagram back to its sender. The buffer must
+// be large enough for the largest test datagram (the proxy delivers full
+// datagrams); a too-small buffer causes EMSGSIZE drops on macOS/BSD.
 void run_udp_echo(int fd, std::atomic<bool>* stop) {
   while (!stop->load()) {
     sockaddr_storage from{};
     socklen_t flen = sizeof from;
-    char buf[4096];
+    char buf[65536];
     sock::IoResult r = sock::recvfrom_some(fd, buf, sizeof buf, &from, &flen);
     if (r.would_block || r.n <= 0) {
       if (r.n < 0) break;
@@ -96,6 +99,27 @@ class PassthroughMutator final : public INetworkMutator {
   DecisionSink sink_;
   std::vector<FaultDecision> none_;
 };
+
+// Read the lone run's events.jsonl produced under runs_root (the test wipes the
+// dir first, so exactly one run exists). Used to prove the fault engine
+// actually emitted decisions rather than silently passing through.
+std::string read_events_jsonl(const std::string& runs_root) {
+  namespace fs = std::filesystem;
+  for (const auto& e : fs::directory_iterator(runs_root)) {
+    if (e.is_directory()) {
+      std::ifstream f((e.path() / "events.jsonl").string());
+      std::stringstream ss;
+      ss << f.rdbuf();
+      return ss.str();
+    }
+  }
+  return "";
+}
+
+bool events_have_kind(const std::string& runs_root, const std::string& kind) {
+  const std::string needle = "\"kind\":\"" + kind + "\"";
+  return read_events_jsonl(runs_root).find(needle) != std::string::npos;
+}
 
 }  // namespace
 
@@ -246,6 +270,232 @@ TEST_CASE("udp applies faults with the real live engine", "[udp]") {
   REQUIRE(::kill(::getpid(), SIGINT) == 0);
   proxy_thread.join();
   CHECK(!proxy_failed.load());
+  // Prove the engine actually applied the latency fault (not a no-op passthrough).
+  CHECK(events_have_kind(cfg.runs_root, "latency"));
+
+  echo_stop.store(true);
+  echo_thread.join();
+  ::close(echo_fd);
+  ::close(cfd);
+}
+
+TEST_CASE("udp corrupt rule transforms the datagram via the live engine", "[udp]") {
+  const Endpoint listen_ep = pick_udp_port();
+  const int echo_fd = sock::udp_bind(Endpoint{"127.0.0.1", 0});
+  const std::uint16_t echo_port = sock::local_port(echo_fd);
+  REQUIRE(echo_port != 0);
+  std::atomic<bool> echo_stop{false};
+  std::thread echo_thread(run_udp_echo, echo_fd, &echo_stop);
+
+  const std::string yaml =
+      "version: 1\n"
+      "seed: 7\n"
+      "listen: " + listen_ep.to_string() + "\n" +
+      "upstream: 127.0.0.1:" + std::to_string(echo_port) + "\n" +
+      "rules:\n"
+      "  - name: scramble\n"
+      "    inject:\n"
+      "      corrupt:\n"
+      "        mode: overwrite\n"
+      "        offset: 0\n"
+      "        value: 0\n";
+  CompiledScenario sc = compile_scenario(yaml);
+
+  ReactorConfig cfg;
+  cfg.scenario = sc;
+  cfg.runs_root = "/tmp/loki-udp-test-corrupt";
+  cfg.transport = TransportMode::Udp;
+  std::filesystem::remove_all(cfg.runs_root);
+
+  std::atomic<bool> proxy_failed{false};
+  std::thread proxy_thread([&]() {
+    MutatorFactory factory = [](const CompiledScenario& scenario, Scheduler& sched,
+                                TimeUs epoch) -> std::unique_ptr<INetworkMutator> {
+      auto engine = make_live_fault_engine(scenario);
+      engine->bind(&sched, epoch);
+      return engine;
+    };
+    try {
+      run_proxy(cfg, factory);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "udp corrupt run failed: %s\n", e.what());
+      proxy_failed.store(true);
+    }
+  });
+
+  const int cfd = sock::udp_connect(listen_ep);
+  REQUIRE(cfd >= 0);
+  constexpr std::size_t kLen = 64;
+  std::vector<std::byte> sent(kLen);
+  for (std::size_t i = 0; i < kLen; ++i) sent[i] = static_cast<std::byte>(0xAB);
+
+  std::vector<std::byte> got(kLen, static_cast<std::byte>(0xFF));
+  std::size_t got_n = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (got_n < kLen && std::chrono::steady_clock::now() < deadline) {
+    sock::write_some(cfd, sent.data(), kLen);
+    struct pollfd pfd{cfd, POLLIN, 0};
+    if (::poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+      sock::IoResult r = sock::read_some(cfd, got.data() + got_n, kLen - got_n);
+      if (r.n > 0) got_n += static_cast<std::size_t>(r.n);
+    }
+  }
+  REQUIRE(got_n == kLen);
+  // First byte was overwritten to 0; the rest are untouched 0xAB.
+  REQUIRE(static_cast<std::uint8_t>(got[0]) == 0);
+  bool rest_ok = true;
+  for (std::size_t i = 1; i < kLen; ++i)
+    if (static_cast<std::uint8_t>(got[i]) != 0xAB) rest_ok = false;
+  REQUIRE(rest_ok);
+
+  REQUIRE(::kill(::getpid(), SIGINT) == 0);
+  proxy_thread.join();
+  CHECK(!proxy_failed.load());
+  CHECK(events_have_kind(cfg.runs_root, "corrupt"));
+
+  echo_stop.store(true);
+  echo_thread.join();
+  ::close(echo_fd);
+  ::close(cfd);
+}
+
+TEST_CASE("udp echoes a large datagram intact", "[udp]") {
+  const Endpoint listen_ep = pick_udp_port();
+  const int echo_fd = sock::udp_bind(Endpoint{"127.0.0.1", 0});
+  const std::uint16_t echo_port = sock::local_port(echo_fd);
+  REQUIRE(echo_port != 0);
+  std::atomic<bool> echo_stop{false};
+  std::thread echo_thread(run_udp_echo, echo_fd, &echo_stop);
+
+  CompiledScenario sc;
+  sc.listen = listen_ep;
+  sc.upstream = Endpoint{"127.0.0.1", echo_port};
+  sc.seed = 1;
+  sc.limits = ProxyLimits{};
+
+  ReactorConfig cfg;
+  cfg.scenario = sc;
+  cfg.runs_root = "/tmp/loki-udp-test-large";
+  cfg.transport = TransportMode::Udp;
+  std::filesystem::remove_all(cfg.runs_root);
+
+  std::atomic<bool> proxy_failed{false};
+  std::thread proxy_thread([&]() {
+    MutatorFactory factory = [](const CompiledScenario& scenario, Scheduler& sched,
+                                TimeUs epoch) -> std::unique_ptr<INetworkMutator> {
+      auto m = std::make_unique<PassthroughMutator>();
+      m->bind(&sched, epoch);
+      (void)scenario;
+      return m;
+    };
+    try {
+      run_proxy(cfg, factory);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "udp large run failed: %s\n", e.what());
+      proxy_failed.store(true);
+    }
+  });
+
+  const int cfd = sock::udp_connect(listen_ep);
+  REQUIRE(cfd >= 0);
+  // 8000 bytes sits above the common 1500-byte MTU (exercises IP fragmentation)
+  // yet under the OS per-datagram send cap (macOS net.inet.udp.maxdgram ~9216),
+  // so the round trip is realistic on every platform the proxy builds on.
+  constexpr std::size_t kLen = 8000;
+  std::vector<std::byte> sent(kLen);
+  for (std::size_t i = 0; i < kLen; ++i) sent[i] = static_cast<std::byte>(i & 0xFF);
+
+  std::vector<std::byte> got(kLen);
+  std::size_t got_n = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (got_n < kLen && std::chrono::steady_clock::now() < deadline) {
+    sock::write_some(cfd, sent.data(), kLen);
+    struct pollfd pfd{cfd, POLLIN, 0};
+    if (::poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+      sock::IoResult r = sock::read_some(cfd, got.data() + got_n, kLen - got_n);
+      if (r.n > 0) got_n += static_cast<std::size_t>(r.n);
+    }
+  }
+  REQUIRE(got_n == kLen);
+  REQUIRE(std::memcmp(sent.data(), got.data(), kLen) == 0);
+
+  REQUIRE(::kill(::getpid(), SIGINT) == 0);
+  proxy_thread.join();
+  CHECK(!proxy_failed.load());
+
+  echo_stop.store(true);
+  echo_thread.join();
+  ::close(echo_fd);
+  ::close(cfd);
+}
+
+TEST_CASE("udp idle_timeout tears down a mapping and logs the decision", "[udp]") {
+  const Endpoint listen_ep = pick_udp_port();
+  const int echo_fd = sock::udp_bind(Endpoint{"127.0.0.1", 0});
+  const std::uint16_t echo_port = sock::local_port(echo_fd);
+  REQUIRE(echo_port != 0);
+  std::atomic<bool> echo_stop{false};
+  std::thread echo_thread(run_udp_echo, echo_fd, &echo_stop);
+
+  const std::string yaml =
+      "version: 1\n"
+      "seed: 5\n"
+      "listen: " + listen_ep.to_string() + "\n" +
+      "upstream: 127.0.0.1:" + std::to_string(echo_port) + "\n" +
+      "rules:\n"
+      "  - name: idle\n"
+      "    inject:\n"
+      "      idle_timeout:\n"
+      "        idle: 10ms\n"
+      "        action: reset\n";
+  CompiledScenario sc = compile_scenario(yaml);
+
+  ReactorConfig cfg;
+  cfg.scenario = sc;
+  cfg.runs_root = "/tmp/loki-udp-test-idle";
+  cfg.transport = TransportMode::Udp;
+  std::filesystem::remove_all(cfg.runs_root);
+
+  std::atomic<bool> proxy_failed{false};
+  std::thread proxy_thread([&]() {
+    MutatorFactory factory = [](const CompiledScenario& scenario, Scheduler& sched,
+                                TimeUs epoch) -> std::unique_ptr<INetworkMutator> {
+      auto engine = make_live_fault_engine(scenario);
+      engine->bind(&sched, epoch);
+      return engine;
+    };
+    try {
+      run_proxy(cfg, factory);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "udp idle run failed: %s\n", e.what());
+      proxy_failed.store(true);
+    }
+  });
+
+  const int cfd = sock::udp_connect(listen_ep);
+  REQUIRE(cfd >= 0);
+  constexpr std::size_t kLen = 32;
+  std::vector<std::byte> sent(kLen, static_cast<std::byte>(0x55));
+
+  // One exchange to open the mapping, then go silent past the idle threshold.
+  std::vector<std::byte> got(kLen);
+  std::size_t got_n = 0;
+  auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (got_n < kLen && std::chrono::steady_clock::now() < dl) {
+    sock::write_some(cfd, sent.data(), kLen);
+    struct pollfd pfd{cfd, POLLIN, 0};
+    if (::poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+      sock::IoResult r = sock::read_some(cfd, got.data() + got_n, kLen - got_n);
+      if (r.n > 0) got_n += static_cast<std::size_t>(r.n);
+    }
+  }
+  REQUIRE(got_n == kLen);
+  ::usleep(80000);  // > idle threshold; the engine should fire idle_timeout
+
+  REQUIRE(::kill(::getpid(), SIGINT) == 0);
+  proxy_thread.join();
+  CHECK(!proxy_failed.load());
+  CHECK(events_have_kind(cfg.runs_root, "idle_timeout"));
 
   echo_stop.store(true);
   echo_thread.join();

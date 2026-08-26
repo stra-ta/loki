@@ -47,7 +47,9 @@ namespace loki {
 
 namespace {
 
-constexpr std::size_t kChunkCap = 16 * 1024;
+// Max IPv4 UDP payload is 65507 bytes; 64 KiB covers it so a single recvfrom
+// never truncates a legal datagram.
+constexpr std::size_t kChunkCap = 65536;
 constexpr ConnId kSignalConnMarker = 0xFFFFFFFFull;
 
 TimeUs steady_now_us(const std::chrono::steady_clock::time_point& epoch) {
@@ -88,6 +90,15 @@ struct UdpConn {
   UdpDirState dir[2];                  // [AtoB, BtoA]
   TimeUs last_activity = 0;
 };
+
+// A direction is over its backpressure bound when both what is already queued
+// for the wire (pending_bytes) and what the scheduler will hand back later
+// (deferred_bytes, inside a scheduled ActDeliver) is counted. Counting only
+// pending_bytes let sustained latency traffic grow scheduler payload memory
+// without bound.
+bool dir_full(const UdpDirState& ds, std::uint64_t pending_bytes_per_direction) {
+  return ds.pending_bytes + ds.deferred_bytes >= pending_bytes_per_direction;
+}
 
 Token up_token(ConnId c) { return Token{FdKind::Upstream, c}; }
 
@@ -161,8 +172,8 @@ void UdpReactor::sync_down_read(TimeUs now) {
   bool allow = mutator_->listener_enabled(now);
   if (allow) {
     for (const auto& kv : conns_) {
-      if (kv.second.dir[static_cast<int>(Dir::AtoB)].pending_bytes >=
-          scenario_->limits.pending_bytes_per_direction) {
+      if (dir_full(kv.second.dir[static_cast<int>(Dir::AtoB)],
+                   scenario_->limits.pending_bytes_per_direction)) {
         allow = false;
         break;
       }
@@ -195,7 +206,7 @@ void UdpReactor::sync_up_events(UdpConn& c) {
   const UdpDirState& ba = c.dir[static_cast<int>(Dir::BtoA)];
   const UdpDirState& ab = c.dir[static_cast<int>(Dir::AtoB)];
   if (ba.read_armed &&
-      ba.pending_bytes < scenario_->limits.pending_bytes_per_direction) {
+      !dir_full(ba, scenario_->limits.pending_bytes_per_direction)) {
     ev = ev | PRead;
   }
   if (!ab.out.empty()) ev = ev | PWrite;
@@ -262,16 +273,17 @@ void UdpReactor::evict_oldest(TimeUs now) {
 }
 
 void UdpReactor::process_chunk(UdpConn& c, Dir d, const char* buf, std::size_t n,
-                               TimeUs now) {
+                                TimeUs now) {
   UdpDirState& ds = c.dir[static_cast<int>(d)];
-  if (!mutator_->read_enabled(StreamKey{c.conn, d}, now)) {
-    return;  // blackhole freeze for this (conn, dir): drop the datagram
-  }
   const StreamStats stats_before = ds.stats;
   ProcessResult pr = mutator_->process_read(
       StreamKey{c.conn, d}, stats_before.bytes_seen,
       std::span<const std::byte>(reinterpret_cast<const std::byte*>(buf), n),
       stats_before, now);
+  // Advance the pristine logical offset exactly as if the datagram were
+  // delivered: blackhole discard still "consumes" the bytes (TCP ACKs into
+  // Loki), so downstream offsets stay consistent. Freeze cannot reach here for
+  // UDP (rejected at validation), so read_enabled false means discard.
   ds.stats.bytes_seen += n;
   ds.stats.chunks_seen += 1;
   if (d == Dir::AtoB)
@@ -279,6 +291,9 @@ void UdpReactor::process_chunk(UdpConn& c, Dir d, const char* buf, std::size_t n
   else
     summary_.bytes_b_to_a += n;
   c.last_activity = now;
+  if (!mutator_->read_enabled(StreamKey{c.conn, d}, now)) {
+    return;  // blackhole discard: drop the transformed output
+  }
   emit_pieces(c, d, std::move(pr), now);
 }
 
@@ -307,6 +322,13 @@ void UdpReactor::enqueue_piece(UdpConn& c, Dir d, OutPiece piece, TimeUs now) {
   UdpDirState& ds = c.dir[static_cast<int>(d)];
   const int send_fd = (d == Dir::AtoB) ? c.up_fd : down_fd_;
   if (send_fd < 0) return;  // no far socket; drop
+  // Zero-length datagrams are legal UDP and must round-trip transparently.
+  if (piece.payload.empty()) {
+    sock::IoResult w = send_bytes(send_fd, d, c, "", 0);
+    (void)w;
+    flush_direction(c, d, now);
+    return;
+  }
 
   // Fast path: an immediate piece with an empty queue goes straight to the wire.
   if (ds.out.empty() && !piece.payload.empty()) {
@@ -392,7 +414,6 @@ void UdpReactor::read_down(TimeUs now) {
     char buf[kChunkCap];
     sock::IoResult r = sock::recvfrom_some(down_fd_, buf, sizeof buf, &from, &flen);
     if (r.would_block || r.n < 0) break;
-    if (r.n == 0) continue;  // empty datagram carries no bytes
     const std::string key = sock::sockaddr_to_str(from, flen);
     ConnId conn;
     auto it = addr_to_conn_.find(key);
@@ -406,8 +427,9 @@ void UdpReactor::read_down(TimeUs now) {
     UdpConn& c = cit->second;
     UdpDirState& ds = c.dir[static_cast<int>(Dir::AtoB)];
     if (ds.bp_paused) break;  // over the backpressure bound: stop reading
+    // r.n may be 0: a legal zero-length datagram, forwarded transparently.
     process_chunk(c, Dir::AtoB, buf, static_cast<std::size_t>(r.n), now);
-    if (ds.pending_bytes >= scenario_->limits.pending_bytes_per_direction) {
+    if (dir_full(ds, scenario_->limits.pending_bytes_per_direction)) {
       ds.bp_paused = true;
       break;
     }
@@ -423,10 +445,11 @@ void UdpReactor::read_up(ConnId conn, TimeUs now) {
   while (!stop_requested_) {
     char buf[kChunkCap];
     sock::IoResult r = sock::read_some(c.up_fd, buf, sizeof buf);
-    if (r.would_block || r.n <= 0) break;
-    if (r.n == 0) continue;
+    if (r.would_block || r.n < 0) break;
+    // r.n == 0: upstream closed its write side (UDP peer sent a zero-length
+    // datagram or shutdown); forward transparently.
     process_chunk(c, Dir::BtoA, buf, static_cast<std::size_t>(r.n), now);
-    if (ba.pending_bytes >= scenario_->limits.pending_bytes_per_direction) {
+    if (dir_full(ba, scenario_->limits.pending_bytes_per_direction)) {
       ba.bp_paused = true;
       ba.read_armed = false;
       sync_up_events(c);
@@ -500,10 +523,13 @@ void UdpReactor::execute_action(Scheduler::Due item, TimeUs now) {
     return;  // accept_stall is rejected for UDP; harmless no-op
   }
   if (auto* fi = std::get_if<ActIdleFire>(&item.action)) {
-    // UDP idle timeout: drop the mapping. Releasing buffered reorder/coalesce
-    // pieces is unnecessary since the mapping is gone; on_connection_closed
-    // (called by teardown) clears the engine's per-conn idle state.
-    teardown_conn(fi->conn, ClosedReason::IdleTimeout, now);
+    // Forward to the engine: it re-arms stale fires, records the idle_timeout
+    // ledger decision, and schedules the configured action (ActReset /
+    // ActFin). The scheduled action is executed by the normal path below, which
+    // performs the mapping teardown. Closing here would both miss the decision
+    // and risk dropping an active mapping at an obsolete deadline.
+    ProcessResult pr = mutator_->on_engine_timer(item.action, now);
+    for (FaultDecision& d : pr.decisions) log_decision(std::move(d));
     return;
   }
   // Engine-internal timers: reorder/coalesce flush release queued pieces.
@@ -535,6 +561,36 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
 
   const int down_fd = sock::udp_bind(config.scenario.listen);
   down_fd_ = down_fd;
+
+  // RAII cleanup guard: guarantees the listener fd, the signal self-pipe, the
+  // global signal write fd, and the installed signal dispositions are released
+  // even if a later setup step throws. Closing an fd removes it from the poller
+  // on both kqueue and epoll, so the explicit poller_->del calls are optional.
+  int sig_read_fd = -1;
+  int sig_write_fd = -1;
+  struct sigaction old_int {};
+  struct sigaction old_term {};
+  bool sig_installed = false;
+  struct Cleanup {
+    int& down_fd;
+    int& sig_read;
+    int& sig_write;
+    struct sigaction& old_int;
+    struct sigaction& old_term;
+    bool& installed;
+    ~Cleanup() {
+      if (down_fd >= 0) { ::close(down_fd); down_fd = -1; }
+      if (sig_read >= 0) { ::close(sig_read); sig_read = -1; }
+      if (sig_write >= 0) { ::close(sig_write); sig_write = -1; }
+      g_signal_write_fd = -1;
+      if (installed) {
+        ::sigaction(SIGINT, &old_int, nullptr);
+        ::sigaction(SIGTERM, &old_term, nullptr);
+      }
+    }
+  };
+  Cleanup cleanup_guard{down_fd_, sig_read_fd, sig_write_fd, old_int, old_term,
+                        sig_installed};
 
   ManifestInfo info;
   info.loki_version = LOKI_VERSION_STRING;
@@ -571,13 +627,16 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
   if (::pipe(sig_fds) != 0) throw std::runtime_error("udp reactor: pipe failed");
   sock::set_nonblock_cloexec(sig_fds[0]);
   sock::set_nonblock_cloexec(sig_fds[1]);
+  sig_read_fd = sig_fds[0];
+  sig_write_fd = sig_fds[1];
   g_signal_write_fd = sig_fds[1];
   struct sigaction sa {};
   sa.sa_handler = loki_udp_signal_handler;
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = 0;
-  ::sigaction(SIGINT, &sa, nullptr);
-  ::sigaction(SIGTERM, &sa, nullptr);
+  ::sigaction(SIGINT, &sa, &old_int);
+  ::sigaction(SIGTERM, &sa, &old_term);
+  sig_installed = true;
   const std::uint64_t signal_token =
       Token{FdKind::Listener, kSignalConnMarker}.raw();
   (void)poller_->add(sig_fds[0], signal_token, PRead);
@@ -619,13 +678,15 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
                 return tx.kind < ty.kind;
               });
 
-    bool down_ready = false;
+    bool down_read_ready = false;
+    bool down_write_ready = false;
     bool control_ready = false;
     bool signal_ready = false;
     for (const PollEvent& ev : events) {
       const Token t = Token::from_raw(ev.token);
       if (t.kind == FdKind::Listener && t.conn == 0) {
-        down_ready = true;
+        if ((ev.events & PRead) != 0) down_read_ready = true;
+        if ((ev.events & PWrite) != 0) down_write_ready = true;
         continue;
       }
       if (t.kind == FdKind::Listener && t.conn == kSignalConnMarker) {
@@ -674,7 +735,17 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
       }
     }
 
-    if (down_ready) read_down(steady_now_us(epoch));
+    // The shared downstream socket became writable: drain queued B-to-A
+    // datagrams (server replies) toward their clients. Without this, replies
+    // could strand in per-conn queues when a sendto would have blocked.
+    if (down_write_ready) {
+      const TimeUs tnow = steady_now_us(epoch);
+      for (auto& entry : conns_) {
+        flush_direction(entry.second, Dir::BtoA, tnow);
+      }
+    }
+
+    if (down_read_ready) read_down(steady_now_us(epoch));
 
     if (signal_ready) {
       char drain[64];
@@ -693,16 +764,11 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
     }
   }
   conns_.clear();
-  (void)poller_->del(down_fd);
-  ::close(down_fd);
   store.events().flush();
 
   summary_.wall_us = steady_now_us(epoch);
   store.finish(metrics_json(), metrics_json());
-
-  ::close(sig_fds[0]);
-  ::close(sig_fds[1]);
-  g_signal_write_fd = -1;
+  // Listener/pipe/signal cleanup is performed by the Cleanup guard at scope exit.
 
   ReactorSummary out = summary_;
   return out;
