@@ -79,6 +79,7 @@ struct UdpDirState {
   bool read_armed = false;             // upstream socket read interest (BtoA)
   bool write_armed = false;            // upstream socket write interest (AtoB)
   bool bp_paused = false;              // reads disarmed by backpressure
+  bool empty_pending = false;          // a zero-length datagram awaiting write
 };
 
 struct UdpConn {
@@ -330,17 +331,12 @@ void UdpReactor::enqueue_piece(UdpConn& c, Dir d, OutPiece piece, TimeUs now) {
   UdpDirState& ds = c.dir[static_cast<int>(d)];
   const int send_fd = (d == Dir::AtoB) ? c.up_fd : down_fd_;
   if (send_fd < 0) return;  // no far socket; drop
-  // Zero-length datagrams are legal UDP and must round-trip transparently. A
-  // would_block (rare for a 0-byte send) is retried via the writable path.
+  // Zero-length datagrams are legal UDP and must round-trip transparently. We
+  // track the pending empty send with a flag (not a queued blob) so it can never
+  // strand at the queue head: a successful 0-byte send returns n == 0, so a
+  // blob-based retry would never be dequeued. flush_direction drains it inline.
   if (piece.payload.empty()) {
-    sock::IoResult w = send_bytes(send_fd, d, c, "", 0);
-    if (w.would_block) {
-      UdpOutBlob blob;
-      blob.logical_offset = piece.logical_offset;
-      ds.out.push_back(std::move(blob));
-      flush_direction(c, d, now);
-      return;
-    }
+    ds.empty_pending = true;
     flush_direction(c, d, now);
     return;
   }
@@ -383,7 +379,20 @@ void UdpReactor::flush_direction(UdpConn& c, Dir d, TimeUs now) {
   if (fd < 0) {
     ds.pending_bytes = 0;
     ds.out.clear();
+    ds.empty_pending = false;
     return;
+  }
+  // Drain a pending zero-length datagram inline. A successful 0-byte send
+  // returns n == 0, so it is treated as complete here (no deque entry needed).
+  if (ds.empty_pending) {
+    sock::IoResult w = send_bytes(fd, d, c, "", 0);
+    if (w.would_block) {
+      if (d == Dir::AtoB) ds.write_armed = true;
+      // fall through: the re-arm at the end re-enables writable interest while
+      // empty_pending stays set for the next flush.
+    } else {
+      ds.empty_pending = false;
+    }
   }
   std::uint64_t flushed = 0;
   while (!ds.out.empty()) {
