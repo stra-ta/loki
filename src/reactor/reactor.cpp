@@ -815,6 +815,7 @@ ReactorSummary run_proxy(const ReactorConfig& config, MutatorFactory factory) {
   // Writes race peer closes constantly in a proxy; EPIPE must surface as a
   // write error, not a process kill.
   ::signal(SIGPIPE, SIG_IGN);
+  if (config.transport == TransportMode::Udp) return run_proxy_udp(config, factory);
   Reactor r;
   return r.run(config, factory);
 }

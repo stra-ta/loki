@@ -200,4 +200,123 @@ void rst_close(int fd) {
 void shutdown_write(int fd) { (void)::shutdown(fd, SHUT_WR); }
 void shutdown_read(int fd) { (void)::shutdown(fd, SHUT_RD); }
 
+// --- UDP helpers -----------------------------------------------------------
+
+// Shared getaddrinfo + socket/bind-or-connect routine for datagram sockets.
+// `do_connect` selects whether we bind (listener-style) or connect (peer-fixed).
+static int udp_resolve(const Endpoint& ep, bool do_connect) {
+  struct addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_DGRAM;
+  hints.ai_flags = AI_PASSIVE | AI_NUMERICHOST;
+  hints.ai_protocol = IPPROTO_UDP;
+
+  const std::string port = std::to_string(ep.port);
+  struct addrinfo* res = nullptr;
+  int rc = ::getaddrinfo(ep.host.c_str(), port.c_str(), &hints, &res);
+  if (rc != 0 && (rc == EAI_NONAME || rc == EAI_FAMILY)) {
+    // Hostnames are allowed for upstream-style endpoints; retry without
+    // AI_NUMERICHOST so "example.com:53" resolves.
+    hints.ai_flags = AI_PASSIVE;
+    rc = ::getaddrinfo(ep.host.c_str(), port.c_str(), &hints, &res);
+  }
+  if (rc != 0) {
+    throw std::runtime_error("udp_resolve: getaddrinfo(" + ep.to_string() +
+                             "): " + ::gai_strerror(rc));
+  }
+
+  int fd = -1;
+  std::string last_err = "no address";
+  for (struct addrinfo* ai = res; ai != nullptr; ai = ai->ai_next) {
+    fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (fd < 0) {
+      last_err = std::strerror(errno);
+      continue;
+    }
+    set_nonblock_cloexec(fd);
+    int one = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (do_connect) {
+      if (::connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
+        last_err = std::strerror(errno);
+        ::close(fd);
+        fd = -1;
+        continue;
+      }
+    } else {
+      if (::bind(fd, ai->ai_addr, ai->ai_addrlen) < 0) {
+        last_err = std::strerror(errno);
+        ::close(fd);
+        fd = -1;
+        continue;
+      }
+    }
+    break;
+  }
+  ::freeaddrinfo(res);
+  if (fd < 0) {
+    throw std::runtime_error("udp_resolve(" + ep.to_string() + "): " + last_err);
+  }
+  return fd;
+}
+
+int udp_bind(const Endpoint& ep) { return udp_resolve(ep, /*do_connect=*/false); }
+
+int udp_connect(const Endpoint& ep) { return udp_resolve(ep, /*do_connect=*/true); }
+
+IoResult recvfrom_some(int fd, void* buf, std::size_t len, sockaddr_storage* from,
+                       socklen_t* fromlen) {
+  IoResult r;
+  ssize_t n;
+  do {
+    n = ::recvfrom(fd, buf, len, 0, reinterpret_cast<sockaddr*>(from), fromlen);
+  } while (n < 0 && errno == EINTR);
+  if (n > 0) {
+    r.n = static_cast<long>(n);
+    return r;
+  }
+  if (n == 0) {
+    // Zero-length datagram: valid but carries no bytes. Surface as n == 0;
+    // the caller skips it.
+    r.n = 0;
+    return r;
+  }
+  if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    r.would_block = true;
+    return r;
+  }
+  r.n = -1;  // hard error surfaced as negative count
+  return r;
+}
+
+IoResult sendto_some(int fd, const void* buf, std::size_t len,
+                     const sockaddr_storage& to, socklen_t tolen) {
+  IoResult r;
+  ssize_t n;
+  do {
+    n = ::sendto(fd, buf, len, 0, reinterpret_cast<const sockaddr*>(&to), tolen);
+  } while (n < 0 && errno == EINTR);
+  if (n >= 0) {
+    r.n = static_cast<long>(n);
+    return r;
+  }
+  if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    r.would_block = true;
+    return r;
+  }
+  r.n = -1;
+  return r;
+}
+
+std::string sockaddr_to_str(const sockaddr_storage& sa, socklen_t len) {
+  char host[NI_MAXHOST];
+  char serv[NI_MAXSERV];
+  if (::getnameinfo(reinterpret_cast<const sockaddr*>(&sa), len, host, sizeof host,
+                    serv, sizeof serv, NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+    if (sa.ss_family == AF_INET6) return std::string("[") + host + "]:" + serv;
+    return std::string(host) + ":" + serv;
+  }
+  return "unknown";
+}
+
 }  // namespace loki::sock

@@ -28,6 +28,7 @@
 #include <loki/replay.hpp>
 #include <loki/scenario.hpp>
 #include <loki/version.hpp>
+#include "../config/validate_transport.hpp"
 
 namespace fs = std::filesystem;
 
@@ -201,6 +202,7 @@ int cmd_run(const std::vector<std::string>& args) {
   std::uint64_t seed = 0;
   bool have_listen = false, have_upstream = false;
   std::string listen_addr, upstream_addr, runs_dir = "runs";
+  TransportMode transport = TransportMode::Tcp;
   enum class LedgerOverride { None, Full, Counts, SampleN };
   LedgerOverride ledger_override = LedgerOverride::None;
   std::uint64_t sample_n = 1;
@@ -232,6 +234,15 @@ int cmd_run(const std::vector<std::string>& args) {
         usage_error("--ledger-sample requires a positive integer");
       }
       ledger_override = LedgerOverride::SampleN;
+    } else if (a == "--transport") {
+      const std::string v = value("--transport");
+      if (v == "tcp") {
+        transport = TransportMode::Tcp;
+      } else if (v == "udp") {
+        transport = TransportMode::Udp;
+      } else {
+        usage_error("--transport must be tcp or udp");
+      }
     } else if (!a.empty() && a[0] == '-') {
       usage_error("unknown flag '" + a + "'");
     } else if (!positional_seen) {
@@ -245,6 +256,14 @@ int cmd_run(const std::vector<std::string>& args) {
 
   const std::string yaml_text = read_file_or_exit(scenario_path, kExitValidation);
   CompiledScenario sc = compile_from_text(yaml_text, scenario_path);
+  try {
+    check_transport_compat(sc, transport);
+  } catch (const ScenarioError& e) {
+    std::fprintf(stderr, "loki: %s: validation error%s%s: %s\n", scenario_path.c_str(),
+                 e.line > 0 ? " at line " : "",
+                 e.line > 0 ? std::to_string(e.line).c_str() : "", e.what());
+    return kExitValidation;
+  }
 
   // Overrides are applied to the compiled plan, then the canonical normalized
   // JSON and its hash are recomputed so evidence reflects what actually ran.
@@ -277,6 +296,7 @@ int cmd_run(const std::vector<std::string>& args) {
   cfg.runs_root = runs_dir;
   cfg.git_sha = LOKI_GIT_SHA;
   cfg.mode = RunMode::Live;
+  cfg.transport = transport;
 
   MutatorFactory factory = [](const CompiledScenario& scenario, Scheduler& sched,
                               TimeUs epoch) -> std::unique_ptr<INetworkMutator> {
@@ -326,10 +346,25 @@ int cmd_run(const std::vector<std::string>& args) {
 int cmd_replay(const std::vector<std::string>& args) {
   std::string run_dir;
   bool check_only = false;
+  TransportMode transport = TransportMode::Tcp;
   bool positional_seen = false;
-  for (const std::string& a : args) {
+  for (size_t i = 0; i < args.size(); ++i) {
+    const std::string& a = args[i];
+    auto value = [&](const char* flag) -> std::string {
+      if (i + 1 >= args.size()) usage_error(std::string(flag) + " requires a value");
+      return args[++i];
+    };
     if (a == "--check-only") {
       check_only = true;
+    } else if (a == "--transport") {
+      const std::string v = value("--transport");
+      if (v == "tcp") {
+        transport = TransportMode::Tcp;
+      } else if (v == "udp") {
+        transport = TransportMode::Udp;
+      } else {
+        usage_error("--transport must be tcp or udp");
+      }
     } else if (!a.empty() && a[0] == '-') {
       usage_error("unknown flag '" + a + "'");
     } else if (!positional_seen) {
@@ -348,6 +383,14 @@ int cmd_replay(const std::vector<std::string>& args) {
   const std::string yaml_text =
       read_file_or_exit(fs::path(run_dir) / "scenario.yaml", kExitRuntime);
   CompiledScenario sc = compile_from_text(yaml_text, fs::path(run_dir) / "scenario.yaml");
+  try {
+    check_transport_compat(sc, transport);
+  } catch (const ScenarioError& e) {
+    std::fprintf(stderr, "loki: replay: validation error%s%s: %s\n",
+                 e.line > 0 ? " at line " : "",
+                 e.line > 0 ? std::to_string(e.line).c_str() : "", e.what());
+    return kExitValidation;
+  }
 
   // The archived scenario must be exactly what produced this ledger.
   // Note: CLI overrides (--seed etc.) apply on top of the archived YAML, so
@@ -381,6 +424,7 @@ int cmd_replay(const std::vector<std::string>& args) {
   cfg.runs_root = "runs";
   cfg.git_sha = LOKI_GIT_SHA;
   cfg.mode = RunMode::LedgerReplay;
+  cfg.transport = transport;
   cfg.ledger_replay_dir = run_dir;
 
   LoadedLedger shared_ledger = std::move(ledger);

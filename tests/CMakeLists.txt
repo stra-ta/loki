@@ -1,6 +1,6 @@
 # Per-area test binaries. Each area directory is ownership-isolated: one
 # package owns one area directory and never edits another's.
-set(LOKI_TEST_AREAS util config transport scheduler reactor faults evidence replay control integration)
+set(LOKI_TEST_AREAS util config transport scheduler reactor faults evidence replay control integration udp)
 
 foreach(area IN LISTS LOKI_TEST_AREAS)
   file(GLOB LOKI_AREA_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/${area}/*.cpp")
