@@ -1,0 +1,50 @@
+{
+  "schema": "stra-ta/results-manifest/v1",
+  "campaign_id": "pilot-loki-evidence-r1-20260830",
+  "experiment_kind": "pilot",
+  "source": {
+    "repository": "stra-ta/loki",
+    "commit": "146827536c6c74a9bf4b73f33d1d0f0d5c6f402f",
+    "dirty": false,
+    "tracked_diff_sha256": null,
+    "dependencies": {}
+  },
+  "machine": {
+    "os": "Darwin",
+    "kernel": "Darwin 24.5.0",
+    "kernel_cmdline": null,
+    "cpu": "Apple M1",
+    "microcode": null,
+    "architecture": "arm64",
+    "numa": null,
+    "governor": null,
+    "turbo": null,
+    "virtualization": "host-or-undetected",
+    "container": "none-detected"
+  },
+  "build": {
+    "compiler": "Apple Clang 21.0.0",
+    "build_type": "Release"
+  },
+  "execution": {
+    "argv": [
+      "echo",
+      "manifest-example"
+    ],
+    "cwd": "/Users/nguyenhuyvu/projects/stra-ta/loki",
+    "seeds": {
+      "seed": 42
+    }
+  },
+  "artifacts": [
+    {
+      "path": "results/example/raw/example.json",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "role": "raw"
+    }
+  ],
+  "notes": [
+    "example manifest \u2014 replace with real campaign before claiming performance"
+  ]
+}
