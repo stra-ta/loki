@@ -1,10 +1,10 @@
 # Loki engineering guide
 
-Loki is a deterministic hostile-network engine: a programmable TCP fault-injection proxy for testing networked systems under ugly transport behavior. One accepted downstream connection maps to one upstream connection; each direction flows through a fault pipeline that can delay, throttle, reshape, corrupt, silence, or terminate traffic according to a compiled scenario and a seed.
+Loki is a deterministic hostile-network engine: a programmable TCP and UDP fault-injection proxy for testing networked systems under ugly transport behavior. One accepted TCP connection maps to one upstream connection; each direction flows through a fault pipeline that can delay, throttle, reshape, corrupt, silence, or terminate traffic according to a compiled scenario and a seed. UDP maps each downstream client endpoint to one connected upstream datagram socket and feeds each datagram through the same transport-agnostic fault engine.
 
 Identity: a deterministic hostile-network engine for reproducing the failures that only appear when real communication goes wrong.
 
-Status: V1. TCP proxying only, single I/O thread, IPv4 + IPv6, byte-stream agnostic (no protocol awareness).
+Status: V1. TCP and UDP proxying, single I/O thread per process, IPv4 + IPv6, byte-stream and datagram agnostic (no application protocol awareness). TLS-aware TCP mode inspects visible ClientHello SNI only; it never decrypts TLS.
 
 ## Build and verify
 
@@ -13,7 +13,7 @@ Status: V1. TCP proxying only, single I/O thread, IPv4 + IPv6, byte-stream agnos
 cmake --preset asan && cmake --build --preset asan   # sanitizer builds when needed
 ```
 
-Requirements: CMake 3.25+, C++20 compiler, Make. Catch2 v3.8.1 is fetched at configure time (the only dependency).
+Requirements: CMake 3.25+, C++20 compiler, Make. Catch2 v3.8.1 is fetched at configure time for tests.
 
 ## Non-negotiable invariants
 
@@ -24,9 +24,11 @@ Requirements: CMake 3.25+, C++20 compiler, Make. Catch2 v3.8.1 is fetched at con
 5. Ledger carries resolved parameters. Every decision records its sampled/resolved numeric outcomes (delay_us actually applied, fragment sizes drawn, permutation chosen). Replay never re-draws randomness.
 6. Strict config. Unknown keys are errors everywhere. The runtime never interprets scenario strings; it consumes CompiledScenario only. Canonical normalized JSON is integer-only with recursively sorted keys and is SHA-256 hashed.
 7. Platform gating. kqueue backend on Apple/BSD, epoll on Linux, behind include/loki/poller.hpp. Core logic builds everywhere; transport backends are the only platform-gated files.
-8. Dependency policy. Catch2 is the only external dependency. Everything else is implemented here.
-9. Exit codes: 0 ok, 2 usage error, 3 scenario validation failure, 4 runtime failure, 5 replay mismatch.
-10. Evidence completeness. Every run produces manifest.json, scenario.yaml, scenario.normalized.json, events.jsonl, connections.jsonl, metrics.json, summary.json under runs/<run-id>/. Manual control-socket injections are logged into the ledger like rule firings.
+8. Transport boundaries. TCP faults operate on byte-stream pieces. UDP faults operate on datagrams; TCP lifecycle faults and UDP freeze are rejected by transport validation. Loki never claims to inject IP packet loss.
+9. TLS boundary. TLS-aware mode parses only the visible ClientHello record and handshake fields needed for `server_name`. It does not terminate TLS, decrypt records, or recover names hidden by encrypted ClientHello.
+10. Dependency policy. Catch2 is the only external dependency. Everything else is implemented here.
+11. Exit codes: 0 ok, 2 usage error, 3 scenario validation failure, 4 runtime failure, 5 replay mismatch.
+12. Evidence completeness. Every run produces manifest.json, scenario.yaml, scenario.normalized.json, events.jsonl, connections.jsonl, metrics.json, summary.json under runs/<run-id>/. Manual control-socket injections are logged into the ledger like rule firings.
 
 ## Naming honesty
 
@@ -55,12 +57,12 @@ rules:                           # optional list
       probability: <float>       # 0..1
       max_occurrences: <uint>
       min_stream_offset: <uint>
-      sni: <str>              # TLS-aware tunneling only: match the SNI extracted
-                              # from the connection's TLS ClientHello. Empty = any.
-                              # Only observable in the data phase; cannot be combined
-                              # with connection-phase faults (connect_delay, refuse,
-                              # accept_stall), which are rejected at compile time.
-                              # UDP has no ClientHello, so when.sni never matches there.
+    sni: <str>              # TLS-aware TCP only: exact match against visible SNI
+                              # extracted from the connection's ClientHello.
+                              # Empty = any. Only observable in the data phase;
+                              # cannot be combined with connection-phase faults
+                              # (connect_delay, refuse, accept_stall), which are
+                              # rejected at compile time. UDP has no ClientHello.
     ledger: full|counts|sample:N # optional, default full
     inject:                      # required; EXACTLY ONE key from below
       latency: {mean: <dur>, jitter: <dur>?}          # uniform +/- jitter
@@ -134,3 +136,8 @@ include/loki is FROZEN during parallel construction: fix contract mistakes throu
 - ledger replay: mechanically re-applied resolved decisions at recorded positions
 
 Platform note: the control socket lives at <runs_root>/<run-id>/control.sock. Unix socket paths are limited to about 100 characters on macOS and 107 on Linux, so keep runs_root short.
+
+## Lab-wide contracts
+
+- See https://github.com/stra-ta/.github/blob/main/LAB_RULES.md and https://github.com/stra-ta/.github/blob/main/EVIDENCE.md and https://github.com/stra-ta/.github/blob/main/COMPATIBILITY.md for lab-wide naming, evidence, and schema contracts.
+- Per https://github.com/stra-ta/.github/blob/main/CONTRIBUTING.md, contributions require the target repo's AGENTS.md, README, and relevant design note, preserve repo boundaries, add the narrowest regression test, run one-command verification, and keep performance claims tied to committed manifests.

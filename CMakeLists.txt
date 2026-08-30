@@ -7,7 +7,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(loki_warnings INTERFACE)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(loki_warnings INTERFACE -Wall -Wextra -Wpedantic)
+  target_compile_options(loki_warnings INTERFACE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  target_compile_options(loki_warnings INTERFACE $<$<CONFIG:Debug>:-Werror>)
 endif()
 
 find_package(Threads REQUIRED)

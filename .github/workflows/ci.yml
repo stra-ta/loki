@@ -1,0 +1,17 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build and test
+        run: |
+          cmake --preset debug
+          cmake --build --preset debug
+          ctest --preset debug --output-on-failure
+      - name: Sanitizer build
+        run: |
+          cmake --preset asan
+          cmake --build --preset asan
+          ctest --preset asan --output-on-failure
