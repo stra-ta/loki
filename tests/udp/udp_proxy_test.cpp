@@ -14,7 +14,10 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <array>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -32,20 +35,30 @@ namespace {
 // UDP echo server: bounces every datagram back to its sender. The buffer must
 // be large enough for the largest test datagram (the proxy delivers full
 // datagrams); a too-small buffer causes EMSGSIZE drops on macOS/BSD.
-void run_udp_echo(int fd, std::atomic<bool>* stop) {
+void run_udp_echo_impl(int fd, std::atomic<bool>* stop,
+                       std::atomic<std::uint64_t>* received) {
   while (!stop->load()) {
     sockaddr_storage from{};
     socklen_t flen = sizeof from;
     char buf[65536];
     sock::IoResult r = sock::recvfrom_some(fd, buf, sizeof buf, &from, &flen);
-    if (r.would_block || r.n <= 0) {
-      if (r.n < 0) break;
+    if (r.would_block) {
       ::usleep(2000);
       continue;
     }
-    if (r.n == 0) continue;
+    if (r.n < 0) break;
+    if (received != nullptr) ++*received;
     sock::sendto_some(fd, buf, static_cast<std::size_t>(r.n), from, flen);
   }
+}
+
+void run_udp_echo(int fd, std::atomic<bool>* stop) {
+  run_udp_echo_impl(fd, stop, nullptr);
+}
+
+void run_udp_echo_counted(int fd, std::atomic<bool>* stop,
+                          std::atomic<std::uint64_t>* received) {
+  run_udp_echo_impl(fd, stop, received);
 }
 
 // Probe a free UDP port by binding then immediately closing.
@@ -121,6 +134,35 @@ bool events_have_kind(const std::string& runs_root, const std::string& kind) {
   return read_events_jsonl(runs_root).find(needle) != std::string::npos;
 }
 
+std::size_t connection_record_count(const std::string& runs_root) {
+  namespace fs = std::filesystem;
+  for (const auto& e : fs::directory_iterator(runs_root)) {
+    if (!e.is_directory()) continue;
+    std::ifstream f((e.path() / "connections.jsonl").string());
+    std::size_t count = 0;
+    std::string line;
+    while (std::getline(f, line)) {
+      if (!line.empty()) ++count;
+    }
+    return count;
+  }
+  return 0;
+}
+
+bool receive_udp_datagram(int fd, std::vector<std::byte>& out,
+                          std::chrono::steady_clock::time_point deadline) {
+  while (std::chrono::steady_clock::now() < deadline) {
+    struct pollfd pfd{fd, POLLIN, 0};
+    if (::poll(&pfd, 1, 100) <= 0 || (pfd.revents & POLLIN) == 0) continue;
+    std::array<std::byte, 65536> buf{};
+    const sock::IoResult r = sock::read_some(fd, buf.data(), buf.size());
+    if (r.n < 0) return false;
+    out.assign(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(r.n));
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 TEST_CASE("udp proxies a datagram end to end", "[udp]") {
@@ -187,6 +229,70 @@ TEST_CASE("udp proxies a datagram end to end", "[udp]") {
   }
   REQUIRE(got_n == kLen);
   REQUIRE(std::memcmp(sent.data(), got.data(), kLen) == 0);
+
+  REQUIRE(::kill(::getpid(), SIGINT) == 0);
+  proxy_thread.join();
+  CHECK(!proxy_failed.load());
+
+  echo_stop.store(true);
+  echo_thread.join();
+  ::close(echo_fd);
+  ::close(cfd);
+}
+
+TEST_CASE("udp preserves a zero-length datagram", "[udp]") {
+  const Endpoint listen_ep = pick_udp_port();
+  const int echo_fd = sock::udp_bind(Endpoint{"127.0.0.1", 0});
+  const std::uint16_t echo_port = sock::local_port(echo_fd);
+  REQUIRE(echo_port != 0);
+  std::atomic<bool> echo_stop{false};
+  std::atomic<std::uint64_t> received{0};
+  std::thread echo_thread(run_udp_echo_counted, echo_fd, &echo_stop, &received);
+
+  CompiledScenario sc;
+  sc.listen = listen_ep;
+  sc.upstream = Endpoint{"127.0.0.1", echo_port};
+  sc.seed = 2;
+
+  ReactorConfig cfg;
+  cfg.scenario = sc;
+  cfg.runs_root = "/tmp/loki-udp-test-zero";
+  cfg.transport = TransportMode::Udp;
+  std::filesystem::remove_all(cfg.runs_root);
+
+  std::atomic<bool> proxy_failed{false};
+  std::thread proxy_thread([&]() {
+    MutatorFactory factory = [](const CompiledScenario& scenario, Scheduler& sched,
+                                TimeUs epoch) -> std::unique_ptr<INetworkMutator> {
+      auto m = std::make_unique<PassthroughMutator>();
+      m->bind(&sched, epoch);
+      (void)scenario;
+      return m;
+    };
+    try {
+      run_proxy(cfg, factory);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "udp zero-length run failed: %s\n", e.what());
+      proxy_failed.store(true);
+    }
+  });
+
+  const int cfd = sock::udp_connect(listen_ep);
+  REQUIRE(cfd >= 0);
+  bool echoed = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!echoed && std::chrono::steady_clock::now() < deadline) {
+    // A zero-length write is a real zero-length datagram on SOCK_DGRAM.
+    sock::write_some(cfd, "", 0);
+    struct pollfd pfd{cfd, POLLIN, 0};
+    if (::poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+      char marker = 0;
+      const sock::IoResult r = sock::read_some(cfd, &marker, sizeof marker);
+      echoed = r.n == 0 && r.closed;
+    }
+  }
+  REQUIRE(echoed);
+  CHECK(received.load() >= 1);
 
   REQUIRE(::kill(::getpid(), SIGINT) == 0);
   proxy_thread.join();
@@ -272,6 +378,147 @@ TEST_CASE("udp applies faults with the real live engine", "[udp]") {
   CHECK(!proxy_failed.load());
   // Prove the engine actually applied the latency fault (not a no-op passthrough).
   CHECK(events_have_kind(cfg.runs_root, "latency"));
+
+  echo_stop.store(true);
+  echo_thread.join();
+  ::close(echo_fd);
+  ::close(cfd);
+}
+
+TEST_CASE("udp duplicate emits two datagrams and records the decision", "[udp]") {
+  const Endpoint listen_ep = pick_udp_port();
+  const int echo_fd = sock::udp_bind(Endpoint{"127.0.0.1", 0});
+  const std::uint16_t echo_port = sock::local_port(echo_fd);
+  REQUIRE(echo_port != 0);
+  std::atomic<bool> echo_stop{false};
+  std::thread echo_thread(run_udp_echo, echo_fd, &echo_stop);
+
+  const std::string yaml =
+      "version: 1\n"
+      "seed: 101\n"
+      "listen: " + listen_ep.to_string() + "\n" +
+      "upstream: 127.0.0.1:" + std::to_string(echo_port) + "\n" +
+      "rules:\n"
+      "  - name: duplicate\n"
+      "    inject:\n"
+      "      duplicate:\n"
+      "        count: 2\n";
+  CompiledScenario sc = compile_scenario(yaml);
+
+  ReactorConfig cfg;
+  cfg.scenario = sc;
+  cfg.runs_root = "/tmp/loki-udp-test-duplicate";
+  cfg.transport = TransportMode::Udp;
+  std::filesystem::remove_all(cfg.runs_root);
+
+  std::atomic<bool> proxy_failed{false};
+  std::thread proxy_thread([&]() {
+    MutatorFactory factory = [](const CompiledScenario& scenario, Scheduler& sched,
+                                TimeUs epoch) -> std::unique_ptr<INetworkMutator> {
+      auto engine = make_live_fault_engine(scenario);
+      engine->bind(&sched, epoch);
+      return engine;
+    };
+    try {
+      run_proxy(cfg, factory);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "udp duplicate run failed: %s\n", e.what());
+      proxy_failed.store(true);
+    }
+  });
+
+  const int cfd = sock::udp_connect(listen_ep);
+  REQUIRE(cfd >= 0);
+  const std::byte value{0x2a};
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  std::vector<std::byte> first;
+  std::vector<std::byte> second;
+  while (first.empty() && std::chrono::steady_clock::now() < deadline) {
+    sock::write_some(cfd, &value, 1);
+    (void)receive_udp_datagram(cfd, first, deadline);
+  }
+  REQUIRE(first.size() == 1);
+  REQUIRE(first[0] == value);
+  REQUIRE(receive_udp_datagram(cfd, second, deadline));
+  REQUIRE(second.size() == 1);
+  CHECK(second[0] == value);
+
+  REQUIRE(::kill(::getpid(), SIGINT) == 0);
+  proxy_thread.join();
+  CHECK(!proxy_failed.load());
+  CHECK(events_have_kind(cfg.runs_root, "duplicate"));
+
+  echo_stop.store(true);
+  echo_thread.join();
+  ::close(echo_fd);
+  ::close(cfd);
+}
+
+TEST_CASE("udp reorder permutes datagrams as a window", "[udp]") {
+  const Endpoint listen_ep = pick_udp_port();
+  const int echo_fd = sock::udp_bind(Endpoint{"127.0.0.1", 0});
+  const std::uint16_t echo_port = sock::local_port(echo_fd);
+  REQUIRE(echo_port != 0);
+  std::atomic<bool> echo_stop{false};
+  std::thread echo_thread(run_udp_echo, echo_fd, &echo_stop);
+
+  const std::string yaml =
+      "version: 1\n"
+      "seed: 202\n"
+      "listen: " + listen_ep.to_string() + "\n" +
+      "upstream: 127.0.0.1:" + std::to_string(echo_port) + "\n" +
+      "rules:\n"
+      "  - name: reorder\n"
+      "    inject:\n"
+      "      reorder:\n"
+      "        depth: 3\n"
+      "        max_hold: 100ms\n";
+  CompiledScenario sc = compile_scenario(yaml);
+
+  ReactorConfig cfg;
+  cfg.scenario = sc;
+  cfg.runs_root = "/tmp/loki-udp-test-reorder";
+  cfg.transport = TransportMode::Udp;
+  std::filesystem::remove_all(cfg.runs_root);
+
+  std::atomic<bool> proxy_failed{false};
+  std::thread proxy_thread([&]() {
+    MutatorFactory factory = [](const CompiledScenario& scenario, Scheduler& sched,
+                                TimeUs epoch) -> std::unique_ptr<INetworkMutator> {
+      auto engine = make_live_fault_engine(scenario);
+      engine->bind(&sched, epoch);
+      return engine;
+    };
+    try {
+      run_proxy(cfg, factory);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "udp reorder run failed: %s\n", e.what());
+      proxy_failed.store(true);
+    }
+  });
+
+  const int cfd = sock::udp_connect(listen_ep);
+  REQUIRE(cfd >= 0);
+  for (std::uint8_t value = 1; value <= 3; ++value) {
+    sock::write_some(cfd, &value, 1);
+  }
+
+  std::vector<std::uint8_t> values;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (values.size() < 3 && std::chrono::steady_clock::now() < deadline) {
+    std::vector<std::byte> datagram;
+    if (!receive_udp_datagram(cfd, datagram, deadline)) break;
+    REQUIRE(datagram.size() == 1);
+    values.push_back(static_cast<std::uint8_t>(datagram[0]));
+  }
+  REQUIRE(values.size() == 3);
+  std::sort(values.begin(), values.end());
+  CHECK(values == std::vector<std::uint8_t>{1, 2, 3});
+
+  REQUIRE(::kill(::getpid(), SIGINT) == 0);
+  proxy_thread.join();
+  CHECK(!proxy_failed.load());
+  CHECK(events_have_kind(cfg.runs_root, "reorder"));
 
   echo_stop.store(true);
   echo_thread.join();
@@ -501,4 +748,92 @@ TEST_CASE("udp idle_timeout tears down a mapping and logs the decision", "[udp]"
   echo_thread.join();
   ::close(echo_fd);
   ::close(cfd);
+}
+
+TEST_CASE("udp fan-in recreates many mappings after idle expiry", "[udp][stress]") {
+  const Endpoint listen_ep = pick_udp_port();
+  const int echo_fd = sock::udp_bind(Endpoint{"127.0.0.1", 0});
+  const std::uint16_t echo_port = sock::local_port(echo_fd);
+  REQUIRE(echo_port != 0);
+  std::atomic<bool> echo_stop{false};
+  std::thread echo_thread(run_udp_echo, echo_fd, &echo_stop);
+
+  const std::string yaml =
+      "version: 1\n"
+      "seed: 303\n"
+      "listen: " + listen_ep.to_string() + "\n" +
+      "upstream: 127.0.0.1:" + std::to_string(echo_port) + "\n" +
+      "limits:\n"
+      "  max_connections: 64\n"
+      "rules:\n"
+      "  - name: expire\n"
+      "    inject:\n"
+      "      idle_timeout:\n"
+      "        idle: 100ms\n"
+      "        action: reset\n";
+  CompiledScenario sc = compile_scenario(yaml);
+
+  ReactorConfig cfg;
+  cfg.scenario = sc;
+  cfg.runs_root = "/tmp/loki-udp-test-fan-in";
+  cfg.transport = TransportMode::Udp;
+  std::filesystem::remove_all(cfg.runs_root);
+
+  std::atomic<bool> proxy_failed{false};
+  std::thread proxy_thread([&]() {
+    MutatorFactory factory = [](const CompiledScenario& scenario, Scheduler& sched,
+                                TimeUs epoch) -> std::unique_ptr<INetworkMutator> {
+      auto engine = make_live_fault_engine(scenario);
+      engine->bind(&sched, epoch);
+      return engine;
+    };
+    try {
+      run_proxy(cfg, factory);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "udp fan-in run failed: %s\n", e.what());
+      proxy_failed.store(true);
+    }
+  });
+
+  constexpr std::size_t kClients = 32;
+  std::vector<int> clients;
+  clients.reserve(kClients);
+  for (std::size_t i = 0; i < kClients; ++i) {
+    const int fd = sock::udp_connect(listen_ep);
+    REQUIRE(fd >= 0);
+    clients.push_back(fd);
+  }
+  // Give the reactor time to bind before creating the first mapping.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  auto round_trip = [&](std::uint8_t value) {
+    for (std::size_t i = 0; i < clients.size(); ++i) {
+      const std::byte sent = static_cast<std::byte>(value + i);
+      std::vector<std::byte> got;
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      bool ok = false;
+      while (!ok && std::chrono::steady_clock::now() < deadline) {
+        sock::write_some(clients[i], &sent, 1);
+        if (receive_udp_datagram(clients[i], got, deadline)) {
+          ok = got.size() == 1 && got[0] == sent;
+        }
+      }
+      REQUIRE(ok);
+    }
+  };
+
+  round_trip(0x10);
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  round_trip(0x80);
+
+  REQUIRE(::kill(::getpid(), SIGINT) == 0);
+  proxy_thread.join();
+  CHECK(!proxy_failed.load());
+  // Every client should have one expired mapping and one recreated mapping.
+  CHECK(connection_record_count(cfg.runs_root) >= kClients * 2);
+
+  echo_stop.store(true);
+  echo_thread.join();
+  for (const int fd : clients) ::close(fd);
+  ::close(echo_fd);
 }

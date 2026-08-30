@@ -549,7 +549,7 @@ void UdpReactor::execute_action(Scheduler::Due item, TimeUs now) {
   if (std::holds_alternative<ActResumeListener>(item.action)) {
     return;  // accept_stall is rejected for UDP; harmless no-op
   }
-  if (auto* fi = std::get_if<ActIdleFire>(&item.action)) {
+  if (std::get_if<ActIdleFire>(&item.action) != nullptr) {
     // Forward to the engine: it re-arms stale fires, records the idle_timeout
     // ledger decision, and schedules the configured action (ActReset /
     // ActFin). The scheduled action is executed by the normal path below, which
@@ -790,15 +790,14 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
     }
   }
 
-  for (auto& entry : conns_) {
-    UdpConn& c = entry.second;
-    if (c.up_fd >= 0) {
-      poller_->del(c.up_fd);
-      ::close(c.up_fd);
-      c.up_fd = -1;
-    }
+  // Close remaining mappings through the normal teardown path so clean
+  // shutdown records their connection evidence and lets the mutator release
+  // per-connection state. The cleanup guard still handles fatal exceptions.
+  const TimeUs stop_now = steady_now_us(epoch);
+  while (!conns_.empty()) {
+    const ConnId conn = conns_.begin()->first;
+    teardown_conn(conn, ClosedReason::ServerClosed, stop_now);
   }
-  conns_.clear();
   store.events().flush();
 
   summary_.wall_us = steady_now_us(epoch);

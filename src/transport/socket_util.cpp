@@ -277,7 +277,7 @@ IoResult recvfrom_some(int fd, void* buf, std::size_t len, sockaddr_storage* fro
   }
   if (n == 0) {
     // Zero-length datagram: valid but carries no bytes. Surface as n == 0;
-    // the caller skips it.
+    // callers must preserve the datagram event rather than treating it as EOF.
     r.n = 0;
     return r;
   }

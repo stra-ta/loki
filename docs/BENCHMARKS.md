@@ -1,51 +1,47 @@
-# Measured results
+# Benchmark evidence policy
 
-All numbers come from `scripts/bench.py`, run locally against a Python
-threaded echo server over loopback TCP. No benchmark framework, no CI
-runner: one script, three measured cases, raw output below.
+The repository does not publish a current Loki throughput or latency number.
+The old loopback snapshot below is retained to explain why it cannot be used as current evidence.
 
-## Environment
+## Historical snapshot
 
-- Apple M1, macOS 26.5.2
-- Loki built with Apple Clang 21.0.0, C++20, default `RelWithDebInfo` preset (no LTO), kqueue backend
-- Client and echo server: CPython 3.11.8 in the same loopback process tree
-- Loki base commit: `3b35e34`; performance changes were uncommitted at measurement time
-- Date: 2026-08-26
+The snapshot was produced by `scripts/bench.py` on 2026-08-26.
+It used commit `3b35e34` with performance changes in an uncommitted working tree.
+The environment was an Apple M1 running macOS 26.5.2 with Apple Clang 21.0.0, C++20, the kqueue backend, and the default `RelWithDebInfo` configuration.
+The client and Python echo server ran over loopback.
 
-## Methodology
-
-Throughput cases echo 128 MiB after an 8 MiB warmup, sending and receiving
-concurrently so neither kernel buffer stalls the other. Five alternating
-direct/proxied rounds, median reported.
-The client is Python in both the direct and proxied cases,
-so client-side costs are identical and the direct-to-proxied ratio isolates
-the proxy's overhead. Absolute MB/s is a bound of this harness, not a limit
-of the engine.
-
-Latency case sends single 4-byte pings with TCP_NODELAY through a rule that
-stamps 50 ms mean, 20 ms jitter one-way latency on both directions. Nominal
-RTT is therefore 100 ms, with a theoretical range of [60, 180] ms from the
-uniform jitter draw alone. 60 round trips.
-
-Throttle case pushes 256 KiB through a 50 KiB/s token bucket with 8 KiB
-burst and measures wall-clock completion.
-
-## Results
-
-| case | configured | measured |
+| case | configured | historical observation |
 | --- | --- | --- |
-| Loopback passthrough, direct client-server | - | 978 MB/s median (4.08 / 7.57 / 7.83 / 8.96 / 9.62 Gbit/s across rounds) |
-| Loopback passthrough through Loki, no rules | - | 398 MB/s median (2.36 / 2.80 / 3.18 / 3.22 / 3.55 Gbit/s) |
-| Latency fault RTT, 50 ms +/- 20 ms per direction | nominal RTT 100 ms, uniform bounds [60, 180] ms | median 107.2 ms, min 71.5 ms, max 139.6 ms (60 samples) |
-| Bandwidth fault, rate 50 KiB/s burst 8 KiB | 50 KiB/s sustained | 50 KiB/s achieved |
+| Loopback direct passthrough | 128 MiB transfer, five alternating rounds | 978 MB/s median |
+| Loopback through Loki without rules | 128 MiB transfer, five alternating rounds | 398 MB/s median |
+| Latency fault RTT | 50 ms +/- 20 ms per direction | 107.2 ms median, 71.5 ms to 139.6 ms across 60 samples |
+| Bandwidth fault | 50 KiB/s rate, 8 KiB burst | 50 KiB/s observed |
 
-## Reading these numbers
+These observations are not a release baseline.
+The source commit, dirty state, harness, and implementation have changed, and the old output is not a committed raw result artifact.
 
-The passthrough gap is the cost of the deterministic single-threaded path:
-every read chunk crosses the mutator and delivery machinery. If your workload
-needs line-rate hostile traffic, run more Loki instances or shard connections;
-V1 has a single I/O thread by specification.
+## Required provenance
 
-Fault accuracy is the point: the throttle held its configured rate to the
-reported integer precision, and the observed RTT distribution sits inside
-the theoretical uniform-jitter envelope with scheduling slack.
+Any new measured artifact must record all of the following alongside raw output:
+
+- source commit SHA and dirty-tree state;
+- compiler and complete build type;
+- kernel, CPU model, architecture, and relevant governor or virtualization state;
+- scenario hash, seed, and exact command-line arguments;
+- metric schema version and evidence class (`functional` or `performance`);
+- workload dimensions, warmup policy, run count, and aggregation rule;
+- paths and hashes for generated tables and raw evidence.
+
+Functional CI proves behavior and invariants.
+Performance evidence requires a separately named campaign and must not be inferred from CI timing.
+Percentiles must be aggregated from raw observations rather than by averaging already aggregated percentiles.
+
+## Running the probe
+
+The existing probe writes nothing into the repository and requires a default-preset build:
+
+```sh
+python3 scripts/bench.py build/default/src/cli/loki
+```
+
+Treat its output as an exploratory observation until it is wrapped in a campaign manifest containing the provenance fields above.

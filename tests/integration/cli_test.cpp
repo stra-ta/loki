@@ -57,6 +57,9 @@ std::string find_loki_binary() {
 // Repo root, found by walking up from this test binary until AGENTS.md and
 // scenarios/ both exist.
 fs::path repo_root() {
+#ifdef LOKI_SOURCE_DIR
+  return fs::path(LOKI_SOURCE_DIR);
+#endif
   char buf[4096];
   std::string self;
 #if defined(__APPLE__)

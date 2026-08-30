@@ -1,0 +1,12 @@
+# Opaque UDP proxy example. Run with: loki run scenarios/udp.yaml --transport udp
+version: 1
+seed: 23
+listen: 127.0.0.1:17811
+upstream: 127.0.0.1:17810
+
+rules:
+  - name: bounded-reorder
+    inject:
+      reorder:
+        depth: 3
+        max_hold: 5ms

@@ -360,23 +360,28 @@ void Reactor::read_leg(ConnState& c, Dir d, TimeUs now) {
      // parser can decide; the bytes are still forwarded verbatim below.
      if (d == Dir::AtoB && !c.sni_done) {
        const std::byte* base = reinterpret_cast<const std::byte*>(buf);
-       c.sni_stage.insert(c.sni_stage.end(), base, base + n);
-       std::string extracted;
-       const loki::tls::ClientHelloStatus st = loki::tls::parse_client_hello_sni(
-           std::span<const std::byte>(c.sni_stage.data(), c.sni_stage.size()),
-           extracted);
-        if (st == loki::tls::ClientHelloStatus::Found) {
-          c.sni = std::move(extracted);
-          c.sni_done = true;
-          mutator_->on_connection_sni(c.conn, c.sni, now);
-        } else if (st == loki::tls::ClientHelloStatus::Incomplete) {
-          // Need more bytes; stop buffering if we've staged an unreasonable
-          // amount (defensive; real ClientHellos are a few hundred bytes).
-          if (c.sni_stage.size() > (std::size_t{1} << 16)) c.sni_done = true;
-        } else {
-          // NotTls or NoSni: no usable SNI for this connection.
-          c.sni_done = true;
-        }
+       if (n > loki::tls::kMaxClientHelloBytes -
+                   std::min(c.sni_stage.size(), loki::tls::kMaxClientHelloBytes)) {
+         // Keep a malicious or unusual prefix from growing the per-connection
+         // inspection buffer without bound. The stream remains transparent.
+         c.sni_done = true;
+       } else {
+         c.sni_stage.insert(c.sni_stage.end(), base, base + n);
+         std::string extracted;
+         const loki::tls::ClientHelloStatus st = loki::tls::parse_client_hello_sni(
+             std::span<const std::byte>(c.sni_stage.data(), c.sni_stage.size()),
+             extracted);
+         if (st == loki::tls::ClientHelloStatus::Found) {
+           c.sni = std::move(extracted);
+           c.sni_done = true;
+           mutator_->on_connection_sni(c.conn, c.sni, now);
+         } else if (st == loki::tls::ClientHelloStatus::Incomplete) {
+           if (c.sni_stage.size() >= loki::tls::kMaxClientHelloBytes) c.sni_done = true;
+         } else {
+           // NotTls or NoSni: no usable SNI for this connection.
+           c.sni_done = true;
+         }
+       }
      }
      // Offset invariant: offset of this chunk's first pristine byte.
     const StreamStats stats_before = ds.stats;  // passed BY VALUE

@@ -1,0 +1,14 @@
+# Match a visible TLS ClientHello server_name without terminating TLS.
+version: 1
+seed: 17
+listen: 127.0.0.1:17711
+upstream: 127.0.0.1:17710
+
+rules:
+  - name: delay-api
+    when:
+      direction: client_to_server
+      sni: api.example.test
+    inject:
+      latency:
+        mean: 25ms

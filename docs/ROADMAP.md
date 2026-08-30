@@ -1,88 +1,48 @@
 # Next phases
 
-This note records the order for work after the V1 TCP byte-stream engine.
-The current performance phase is intentionally first because the reactor and
-delivery seam will be shared by every later transport.
+Loki's current baseline is a deterministic single-threaded TCP and UDP proxy with opaque TLS pass-through and visible ClientHello SNI matching.
+The following work is intentionally separated by transport boundary and evidence maturity.
 
-## Phase 1: performance
+## Current baseline
 
-Scope: the existing single-threaded TCP path, with the frozen byte-stream
-engine contract and evidence format unchanged.
+- TCP byte-stream faulting and evidence replay are implemented.
+- UDP datagram mapping, transport-compatible faults, and idle mapping expiry are implemented.
+- TLS-aware SNI inspection parses fragmented ClientHello messages without decryption.
+- Functional tests are the current evidence baseline.
+- No current throughput or latency headline is published; the old snapshot is historical and explicitly non-current in [BENCHMARKS.md](BENCHMARKS.md).
 
-1. Measure the optimized `RelWithDebInfo` baseline with `scripts/bench.py`.
-2. Attribute CPU time, allocations, syscalls, scheduler work, and evidence
-   writes across passthrough, immediate faults, delayed faults, and full-ledger
-   runs.
-3. Optimize the confirmed hot path only. The first direct-delivery fast path
-   is now in `src/reactor/reactor.cpp::enqueue_piece`.
-4. Preserve chunk boundaries, scheduler sequence order, memory accounting,
-   replay output, and fault composition.
+## Phase 1: evidence and stress coverage
 
-The first production candidate is direct delivery of an immediately due piece
-into an empty output direction.
-If the socket accepts the whole payload, the reactor can avoid materializing an
-`OutBlob`.
-Partial writes and `EAGAIN` still fall back to the existing FIFO queue.
+1. Add deterministic scenario semantic-property tests and parser fuzz targets.
+2. Add TLS ClientHello and evidence-ledger fuzz targets with bounded inputs.
+3. Run UDP mapping-expiry, many-client fan-in, reorder, duplicate, and corruption campaigns on Linux and macOS.
+4. Add connection-churn and concurrency matrices with complete environment metadata.
+5. Profile passthrough and fault-heavy paths before changing the reactor.
 
-The `include/loki` contracts remain frozen during this phase.
+Every performance artifact must include the source commit, dirty-tree state, compiler, kernel, CPU, architecture, build type, seed, command line, scenario hash, and raw evidence path.
 
-## Phase 2: UDP transport
+## Phase 2: protocol-aware inspection
 
-UDP should add a datagram-specific transport adapter rather than forcing
-datagrams through TCP stream offsets or FIN/RST lifecycle actions.
+Protocol-aware rules belong above transport reassembly and must preserve a mapping to pristine byte offsets.
+The first protocol milestone should target one explicitly supported protocol with malformed-frame behavior, partial-frame buffering, maximum frame size, and replay positions specified before implementation.
 
-The transport boundary needs explicit datagram identity, source/destination
-metadata, truncation behavior, and queue accounting.
-Byte faults can remain reusable where their semantics make sense, but stream
-faults such as `half_close`, `fin`, and `connect_delay` need datagram-specific
-definitions or must be rejected by validation.
+HTTP/1 metadata matching may follow those invariants.
+HTTP/2 requires explicit stream semantics before any matching or rewriting is attempted.
 
-The first UDP milestone should be an opaque datagram proxy with loss,
-duplication, delay, reorder, corruption, and rate limiting.
-Protocol-aware UDP rules should come later.
+## Phase 3: optional TLS termination
 
-## Phase 3: TLS support
-
-TLS has two distinct products and must not be conflated:
-
-- opaque TLS pass-through, which already works as ordinary TCP traffic;
-- TLS termination and re-encryption, which enables inspection of decrypted
-  application bytes and requires certificate/key configuration, handshake
-  lifecycle, and secret-handling rules.
-
-The termination design should sit behind a delivery adapter after the TCP
-performance seam is stable.
-The fault engine must receive a clear byte-domain contract: ciphertext bytes,
-plaintext bytes, or both.
-Evidence must never record private key material or plaintext by default.
-
-## Phase 4: protocol-aware faulting
-
-Protocol-aware rules belong above transport reassembly and, when enabled, above
-TLS decryption.
-
-The parser should be an optional adapter that turns a byte stream into frames
-or messages while preserving a mapping back to pristine byte offsets.
-Existing byte-level faults remain the lowest layer.
-Protocol rules should be able to match metadata without changing the ordering
-and replay guarantees of the byte engine.
-
-The first protocol milestone should target one explicitly supported protocol,
-with malformed-frame behavior, partial-frame buffering, maximum frame size,
-and replay positions specified before implementation.
+Opaque TLS pass-through and ClientHello inspection do not imply TLS termination.
+Termination and re-encryption would require certificate and key configuration, handshake lifecycle rules, secret-handling rules, and an explicit fault byte domain.
+No termination implementation is planned until those contracts and evidence requirements exist.
 
 ## Dependency order
 
 ```text
-optimized TCP delivery seam
+functional TCP and UDP baseline
           |
-          +--> UDP datagram adapter
+          +--> bounded stress and evidence campaigns
           |
-          +--> TLS termination adapter
+          +--> protocol metadata adapters
                          |
-                         +--> protocol parser and message-level rules
+                         +--> optional TLS termination
 ```
-
-UDP and TLS should share transport-adapter vocabulary, but neither should
-generalize `StreamStats`, `OutPiece`, or `ActDeliver` speculatively before its
-real semantics are known.

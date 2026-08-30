@@ -58,6 +58,17 @@ std::string self_path() {
   return buf;
 }
 
+std::string scenario_path(const std::string& name) {
+#ifdef LOKI_SOURCE_DIR
+  return (std::filesystem::path(LOKI_SOURCE_DIR) / "scenarios" / name).string();
+#else
+  if (const char* env = std::getenv("LOKI_SOURCE_DIR"); env && *env) {
+    return (std::filesystem::path(env) / "scenarios" / name).string();
+  }
+  return name;
+#endif
+}
+
 // Locate the loki binary relative to this test binary
 // (build/<preset>/tests/integration/loki_test_integration).
 std::string find_loki_bin() {
@@ -359,7 +370,7 @@ TEST_CASE("e2e: basic passthrough is byte-identical", "[integration][e2e]") {
   int listen_port = free_port();
   std::string dir = temp_dir();
   std::string scenario = dir + "/basic.yaml";
-  auto text = slurp("/Users/nguyenhuyvu/Projects/loki/scenarios/basic.yaml");
+  auto text = slurp(scenario_path("basic.yaml"));
   replace_all(text, "17601", std::to_string(listen_port));
   replace_all(text, "17600", std::to_string(server.port()));
   write_file(scenario, text);
@@ -407,7 +418,7 @@ TEST_CASE("e2e: fragment preserves byte stream", "[integration][e2e]") {
   int listen_port = free_port();
   std::string dir = temp_dir();
   std::string scenario = dir + "/fragment.yaml";
-  auto text = slurp("/Users/nguyenhuyvu/Projects/loki/scenarios/fragment.yaml");
+  auto text = slurp(scenario_path("fragment.yaml"));
   replace_all(text, "17611", std::to_string(listen_port));
   replace_all(text, "17610", std::to_string(server.port()));
   write_file(scenario, text);
@@ -444,7 +455,7 @@ TEST_CASE("e2e: latency delays delivery within expected bounds", "[integration][
   int listen_port = free_port();
   std::string dir = temp_dir();
   std::string scenario = dir + "/latency.yaml";
-  auto text = slurp("/Users/nguyenhuyvu/Projects/loki/scenarios/latency.yaml");
+  auto text = slurp(scenario_path("latency.yaml"));
   replace_all(text, "17621", std::to_string(listen_port));
   replace_all(text, "17620", std::to_string(server.port()));
   write_file(scenario, text);
@@ -484,7 +495,7 @@ TEST_CASE("e2e: throttle caps throughput", "[integration][e2e]") {
   int listen_port = free_port();
   std::string dir = temp_dir();
   std::string scenario = dir + "/throttle.yaml";
-  auto text = slurp("/Users/nguyenhuyvu/Projects/loki/scenarios/throttle.yaml");
+  auto text = slurp(scenario_path("throttle.yaml"));
   replace_all(text, "17631", std::to_string(listen_port));
   replace_all(text, "17630", std::to_string(server.port()));
   write_file(scenario, text);
@@ -525,7 +536,7 @@ TEST_CASE("e2e: blackhole discards traffic then recovers", "[integration][e2e]")
   int listen_port = free_port();
   std::string dir = temp_dir();
   std::string scenario = dir + "/blackhole.yaml";
-  auto text = slurp("/Users/nguyenhuyvu/Projects/loki/scenarios/blackhole.yaml");
+  auto text = slurp(scenario_path("blackhole.yaml"));
   replace_all(text, "17651", std::to_string(listen_port));
   replace_all(text, "17650", std::to_string(server.port()));
   write_file(scenario, text);
@@ -572,7 +583,7 @@ TEST_CASE("e2e: deterministic replay produces identical ledger", "[integration][
     int listen_port = free_port();
     std::string dir = temp_dir();
     std::string scenario = dir + "/fragment.yaml";
-    auto text = slurp("/Users/nguyenhuyvu/Projects/loki/scenarios/fragment.yaml");
+    auto text = slurp(scenario_path("fragment.yaml"));
     replace_all(text, "17611", std::to_string(listen_port));
     replace_all(text, "17610", std::to_string(server.port()));
     write_file(scenario, text);
@@ -635,7 +646,7 @@ TEST_CASE("e2e: ledger replay re-applies recorded decisions", "[integration][e2e
   int listen_port = free_port();
   std::string dir = temp_dir();
   std::string scenario = dir + "/fragment.yaml";
-  auto text = slurp("/Users/nguyenhuyvu/Projects/loki/scenarios/fragment.yaml");
+    auto text = slurp(scenario_path("fragment.yaml"));
   replace_all(text, "17611", std::to_string(listen_port));
   replace_all(text, "17610", std::to_string(server.port()));
   write_file(scenario, text);
