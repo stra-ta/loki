@@ -1,7 +1,5 @@
 # Loki
 
-<!-- CI pending: Loki has no GitHub workflow yet -->
-
 A deterministic TCP and UDP fault-injection proxy for failures that only appear when communication goes wrong.
 
 ![Loki data path through the reactor, fault engine, scheduler, and evidence store](docs/ARCHITECTURE.svg)
