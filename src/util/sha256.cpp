@@ -71,18 +71,21 @@ std::array<std::uint8_t, 32> sha256(const void* data, std::size_t len) {
   tail[remaining] = 0x80;
   std::memset(tail + remaining + 1, 0, tail_len - remaining - 1);
   const std::uint64_t bits = static_cast<std::uint64_t>(len) * 8;
-  for (int i = 0; i < 8; ++i) {
-    tail[tail_len - 1 - i] = static_cast<std::uint8_t>(bits >> (8 * i));
+  for (std::size_t i = 0; i < 8; ++i) {
+    tail[static_cast<std::size_t>(tail_len) - 1 - i] =
+        static_cast<std::uint8_t>(bits >> (8 * i));
   }
   compress(h, tail);
   if (tail_len == 128) compress(h, tail + 64);
 
   std::array<std::uint8_t, 32> out{};
   for (int i = 0; i < 8; ++i) {
-    out[4 * i] = static_cast<std::uint8_t>(h[i] >> 24);
-    out[4 * i + 1] = static_cast<std::uint8_t>(h[i] >> 16);
-    out[4 * i + 2] = static_cast<std::uint8_t>(h[i] >> 8);
-    out[4 * i + 3] = static_cast<std::uint8_t>(h[i]);
+    const auto base = static_cast<std::size_t>(4 * i);
+    const auto hi = static_cast<std::size_t>(i);
+    out[base] = static_cast<std::uint8_t>(h[hi] >> 24);
+    out[base + 1] = static_cast<std::uint8_t>(h[hi] >> 16);
+    out[base + 2] = static_cast<std::uint8_t>(h[hi] >> 8);
+    out[base + 3] = static_cast<std::uint8_t>(h[hi]);
   }
   return out;
 }

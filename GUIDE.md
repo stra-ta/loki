@@ -1,176 +1,135 @@
-# Loki
-
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)
-![CMake 3.25+](https://img.shields.io/badge/CMake-3.25%2B-064F8C.svg)
-![TCP and UDP](https://img.shields.io/badge/protocol-TCP%20%2B%20UDP-2E8B57.svg)
-![Catch2 3.8.1](https://img.shields.io/badge/tests-Catch2%203.8.1-F0B323.svg)
+# Loki guide
 
 ## Claim
 
-Loki is a deterministic hostile-network engine for testing networked systems under controlled transport failures.
+Loki is a deterministic hostile-network engine for testing networked systems
+under controlled transport failures.
 
-It proxies TCP byte streams and UDP datagrams through a scenario-driven fault pipeline that can delay, throttle, fragment, coalesce, reorder, duplicate, corrupt, discard, or terminate traffic.
+It proxies TCP byte streams and UDP datagrams through a scenario-driven fault
+pipeline that can delay, throttle, fragment, reorder, duplicate, or corrupt
+traffic, and it records every resolved fault decision so a run can be
+inspected and replayed.
 
-Loki records resolved fault decisions in an evidence directory so a run can be inspected and replayed.
-
-The implementation is pre-1.0 software with a single I/O thread per proxy process.
+The implementation is V1, pre-1.0, with a single I/O thread per proxy process.
 
 ### Transport semantics
 
 TCP rules operate on application byte streams.
 Fragmentation and reordering act on Loki's logical pieces, not IP packets.
-TCP lifecycle faults such as FIN, reset, and freeze are therefore meaningful only for TCP.
 
-UDP rules operate on datagrams and preserve datagram boundaries unless a configured byte-shaping fault intentionally emits multiple datagrams.
-There is one mapping per downstream client endpoint, and mappings expire through `idle_timeout`.
-UDP has no TCP half-close or connection phase, so those faults are rejected during validation.
+UDP rules operate on datagrams and preserve datagram boundaries unless a
+configured byte-shaping fault intentionally emits multiple datagrams.
+There is one mapping per downstream client endpoint, created on the first
+datagram from that endpoint and removed on a fatal socket error or at proxy
+stop.
 
-TLS-aware TCP mode inspects the cleartext ClientHello for the `server_name` extension and exposes the result to `when.sni` rules.
-This is ClientHello inspection only: Loki does not terminate TLS, decrypt records, or make claims about encrypted ClientHello names.
+The fault vocabulary is transport-agnostic: the same six faults apply to both
+transports, with datagram semantics where they differ.
 
 Loki is a stream and datagram proxy, not a packet simulator.
 
-## Evidence
-
-The repository's current evidence is functional and structural.
-Run the test suite to exercise the live TCP and UDP paths, parser bounds, fault semantics, evidence writers, replay, and CLI behavior:
-
-```sh
-ctest --test-dir build/default --output-on-failure
-```
-
-The test suite is not a performance claim.
-The previous loopback throughput snapshot was measured from an older commit with an uncommitted working tree and is retained only as historical context in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
-It must not be used as a current Loki number.
-
-Every live run writes `manifest.json`, `scenario.yaml`, `scenario.normalized.json`, `events.jsonl`, `connections.jsonl`, `metrics.json`, and `summary.json` under `runs/<run-id>/`.
-The manifest records the scenario hash, seed, software identifiers, and platform fields available to the run.
-
-![Evidence lifecycle: scenario plus seed recorded into seven artifacts, then replayed against the same workload](docs/EVIDENCE.svg)
-
-## Architecture
-
-![Loki data path: reactor feeds chunks to the fault engine, scheduler releases pieces at their deadlines, evidence store records decisions](docs/ARCHITECTURE.svg)
-
-A single-threaded reactor owns sockets, the deadline scheduler, the fault engine, evidence writers, and the Unix-domain control plane.
-Each TCP direction feeds pristine bytes to the mutator.
-The UDP adapter maps client endpoints to connected upstream datagram sockets and feeds each datagram through the same transport-agnostic mutator.
-
-Rules evaluate in ascending index.
-Shape faults transform pieces, timing faults stamp send deadlines, and silence or lifecycle faults queue side effects.
-Pending bytes are bounded by `limits.pending_bytes_per_direction`; a full TCP direction stops reading until it drains.
-The transport backend is platform-gated behind one interface: kqueue on macOS and BSD, epoll on Linux.
-
 ## Build
 
-Requirements: CMake 3.25+, a C++20 compiler, and Make.
-Catch2 v3.8.1 is fetched at configure time for tests.
-
 ```sh
-./scripts/build.sh
+./scripts/build.sh              # configure default preset, build, ctest
+./scripts/build.sh release      # other presets: debug, release, asan, ubsan
+./scripts/build.sh asan --no-test
 ```
 
-Run a TCP proxy between a client and an echo or real service:
+Requirements: CMake 3.25+, a C++20 compiler, Make. Catch2 v3.8.1 is fetched at
+configure time for tests.
 
-```sh
-# terminal 1
-python3 -m http.server 8080
+Presets live in `CMakePresets.json`; `cmake --preset debug`, `cmake --build --preset debug`,
+and `ctest --preset debug` are the direct equivalents.
 
-# terminal 2
-./build/default/src/cli/loki run scenarios/latency.yaml --seed 123
-```
+## Scenarios
 
-Run a UDP proxy with the same CLI and an explicit transport selection:
-
-```sh
-./build/default/src/cli/loki run scenarios/udp.yaml --transport udp
-```
-
-## Verification
-
-```sh
-loki validate SCENARIO.yaml                 # strict validation only
-loki run SCENARIO.yaml [--seed N]           # live proxy until SIGTERM/SIGINT
-    [--transport tcp|udp] [--listen ADDR] [--upstream ADDR] [--runs-dir DIR]
-    [--full-ledger | --ledger-counts | --ledger-sample N]
-loki replay RUN_DIR [--check-only]          # re-apply recorded decisions
-loki inspect RUN_DIR [--summary | --connections | --events --tail N]
-loki ctl RUN_DIR_OR_SOCK CMD [CONN]         # pause, resume, status, inject
-```
-
-Exit codes are `0` for success, `2` for usage errors, `3` for scenario validation failures, `4` for runtime failures, and `5` for replay mismatches.
-
-### TCP scenario
+A scenario declares the listener, the upstream, optional limits, and a rule
+list:
 
 ```yaml
 version: 1
 seed: 7
-listen: 127.0.0.1:17611
-upstream: 127.0.0.1:17610
-
+listen: 127.0.0.1:9000
+upstream: 127.0.0.1:9001
+limits:
+  pending_bytes_per_direction: 1048576
+  max_connections: 1024
 rules:
-  - name: shred
+  - name: sluggish-link
     when:
       direction: client_to_server
-    inject:
-      fragment:
-        min: 1
-        max: 8
-```
-
-### TLS SNI matching
-
-```yaml
-version: 1
-seed: 17
-listen: 127.0.0.1:17711
-upstream: 127.0.0.1:17710
-
-rules:
-  - name: delay-api
-    when:
-      direction: client_to_server
-      sni: api.example.test
+      every_bytes: 4096
+      probability: 0.25
     inject:
       latency:
-        mean: 25ms
+        mean: 5ms
+        jitter: 2ms
 ```
 
-`when.sni` is an exact match against a visible `host_name` entry in the client's ClientHello.
-The rule is evaluated after enough initial client bytes have arrived to make a parser decision.
-Non-TLS traffic, absent SNI, and encrypted ClientHello names produce no SNI match while the original bytes continue through the proxy unchanged.
-See [docs/TLS.md](docs/TLS.md) for parser limits and malformed-input behavior.
+Example scenarios live in `scenarios/`: `basic`, `fragment`, `latency`,
+`reorder`, `throttle`, `composite` (composed pipeline), and `udp`.
 
-### UDP scenario
+### The six faults
 
-Use [scenarios/udp.yaml](scenarios/udp.yaml) with `--transport udp`.
-UDP mappings are keyed by the downstream source endpoint and are removed after the configured idle timeout.
-See [docs/UDP.md](docs/UDP.md) for boundary, fault, and evidence semantics.
+| Fault | Parameters | Behavior |
+| --- | --- | --- |
+| `latency` | `mean`, `jitter` or `distribution: normal` + `stddev` | stamps each piece with a send deadline |
+| `bandwidth` | `rate` bytes/sec, `burst` bytes | token-bucket pacing per direction, serialized so pieces leave in order |
+| `fragment` | `min`, `max` | splits pieces into random sizes, order preserved |
+| `reorder` | `depth >= 2`, `max_hold` | holds up to `depth` pieces and releases a Fisher-Yates permutation |
+| `duplicate` | `count` | emits extra copies of every piece |
+| `corrupt` | `mode: xor\|overwrite`, `offset`, `value` | rewrites one byte at an absolute pristine stream offset |
 
-### Evidence and replay
+Match conditions (`when`): `direction`, `after`, `every_bytes`,
+`every_events`, `connection: {every, equals}`, `probability`,
+`max_occurrences`, `min_stream_offset`.
 
-Seed replay asks whether the same workload creates the same deterministic schedule.
-Ledger replay consumes recorded decisions at recorded positions and therefore requires the workload to be enacted again.
-Neither mode treats wall-clock timestamps as decision inputs.
+Rules evaluate in ascending index. Deterministic guards run before the
+probability draw, so a rule consumes RNG only when it actually fires.
+
+## Run, replay, inspect
+
+```sh
+loki run SCENARIO.yaml [--seed N] [--listen ADDR] [--upstream ADDR]
+    [--transport tcp|udp] [--runs-dir DIR]
+    [--full-ledger | --ledger-counts | --ledger-sample N]
+loki validate SCENARIO.yaml
+loki replay RUN_DIR [--check-only]
+loki inspect RUN_DIR [--summary | --connections | --events --tail N]
+```
+
+Exit codes: 0 ok, 2 usage error, 3 scenario validation failure, 4 runtime
+failure, 5 replay mismatch.
+
+Every run writes seven artifacts under `runs/<run-id>/`: `manifest.json`,
+`scenario.yaml`, `scenario.normalized.json`, `events.jsonl`,
+`connections.jsonl`, `metrics.json`, `summary.json`.
+
+Replay re-applies the recorded resolved decisions at their recorded logical
+positions without drawing RNG: `replay --check-only` verifies the ledger, and
+a full replay reproduces the byte stream.
+
+## Evidence
+
+Functional tests are the current evidence baseline: the suite covers parser
+bounds, fault semantics, engine draw order, TCP and UDP end-to-end paths,
+determinism, evidence writers, replay, and CLI behavior.
+
+No current throughput or latency number is published.
+The historical loopback snapshot in [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+is retained with its commit, dirty-tree state, and toolchain context, and must
+not be used as a current Loki number.
 
 ## Limitations
 
-Loki does not terminate TLS or inspect decrypted application bytes.
-It does not emulate IP packet loss, routing, MTU behavior, congestion control, or kernel-level network queues.
-UDP has no stream offsets or lifecycle half-close semantics, and one shared listener cannot freeze reads for only one UDP client.
-The current process uses one I/O thread and the repository does not publish a current performance baseline.
-Unix socket paths are limited to about 100 characters on macOS and 107 on Linux, so keep run roots short.
-
-## Documentation
-
-- [Architecture diagram](docs/ARCHITECTURE.svg) - reactor, mutator, scheduler, and evidence data path.
-- [UDP semantics](docs/UDP.md) - datagram boundaries, mappings, and UDP fault behavior.
-- [TLS inspection](docs/TLS.md) - ClientHello and SNI inspection without decryption.
-- [Benchmark evidence policy](docs/BENCHMARKS.md) - historical measurements and current provenance requirements.
-- [Roadmap](docs/ROADMAP.md) - remaining transport and protocol work.
-- [Evidence lifecycle](docs/EVIDENCE.svg) - recorded decisions, artifacts, and ledger replay.
+- Single I/O thread per process.
+- No TLS awareness; encrypted traffic is opaque to rules.
+- No connection lifecycle faults (no reset/FIN/refusal injection).
+- Reordering and duplication describe Loki's logical pieces, not packets.
+- Scenarios are validated against a strict YAML subset; unknown keys are
+  errors.
 
 ## License
 
-[MIT](LICENSE)
+Loki is released under the [MIT License](LICENSE).

@@ -10,16 +10,14 @@ The first datagram from that endpoint creates a mapping and a connected UDP sock
 Subsequent datagrams from the same source endpoint use that mapping.
 Responses from the connected upstream socket are sent to the mapped downstream endpoint.
 
-Mappings are removed by `idle_timeout`, by a fatal socket error, or when the proxy stops.
-The idle timer is refreshed by traffic on either leg.
-There is no TCP FIN or RST in UDP, so TCP lifecycle faults are rejected during transport validation.
+Mappings are removed by a fatal socket error or when the proxy stops.
+There are no connection lifecycle events in UDP.
 
 ## Datagram boundaries
 
 Without a shaping fault, one input datagram produces one output datagram with the same payload.
 The adapter preserves zero-length datagrams and records them as data events.
-The `fragment` fault may intentionally emit several datagrams from one input datagram.
-The `coalesce` fault may hold datagrams and emit a combined byte payload when its size or deadline is reached.
+The `fragment` fault may intentionally emit several datagrams from one input datagram, and the `duplicate` fault may emit copies.
 These transformations are explicit scenario behavior, not claims about IP packet handling.
 
 `stream_offset` remains a cumulative logical byte offset for the shared fault engine.
@@ -27,9 +25,7 @@ It is not a wire packet number and cannot describe UDP ordering at the network l
 
 ## Supported fault behavior
 
-Delay, bandwidth, fragment, coalesce, reorder, duplicate, corrupt, discard, and idle timeout are transport-agnostic faults usable with UDP when their parameters are valid.
-`blackhole` with `freeze` is rejected because a shared UDP listener cannot stop reading one client without affecting every client.
-`reset`, `fin`, `half_close`, `connect_delay`, `refuse`, and `accept_stall` are rejected for UDP.
+Delay, bandwidth, fragment, reorder, duplicate, and corrupt are the whole fault vocabulary, and all six are usable with UDP when their parameters are valid.
 
 Reordering is across Loki output datagrams held in the configured window.
 Duplication produces additional datagrams with the same transformed payload.

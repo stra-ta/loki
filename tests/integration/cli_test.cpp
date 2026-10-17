@@ -6,7 +6,9 @@
 // use short-lived runs signaled with SIGINT and check artifact completeness;
 // everything else uses fabricated or minimal run directories.
 
+#if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#endif
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -30,11 +32,6 @@ namespace {
 // Locate the loki executable relative to this test binary:
 // <build>/tests/integration/<test> lives next to <build>/src/cli/loki.
 std::string find_loki_binary() {
-  const std::vector<fs::path> candidates = {
-      fs::path("/proc/self/exe"),  // placeholder replaced below
-  };
-  (void)candidates;
-
   char buf[4096];
   std::string self;
 #if defined(__APPLE__)
@@ -329,13 +326,3 @@ TEST_CASE("inspect reports summaries, connections, and event tails", "[cli]") {
   CHECK(run_cli({"inspect", dir, "--tail", "5"}).exit_code == 2);
 }
 
-TEST_CASE("ctl against a dead socket exits 4", "[cli]") {
-  const fs::path dead = fs::temp_directory_path() / "loki-cli-test" / "dead.sock";
-  std::error_code ec;
-  fs::remove(dead, ec);
-  CHECK(run_cli({"ctl", dead.string(), "status"}).exit_code == 4);
-
-  const fs::path dir = fs::temp_directory_path() / "loki-cli-test" / "ctl-dir";
-  fs::create_directories(dir);
-  CHECK(run_cli({"ctl", dir.string(), "status"}).exit_code == 4);
-}

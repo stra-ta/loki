@@ -6,10 +6,9 @@
 // with a cumulative logical offset; the engine's RNG draw order, determinism
 // contract, and all transport-agnostic faults therefore apply unchanged.
 //
-// TCP-only lifecycle faults (reset/fin/half_close/refuse/accept_stall/
-// connect_delay) are rejected at scenario-validation time (see
-// check_transport_compat), so the engine never emits ActReset/ActFin/... for
-// UDP except via idle_timeout, which the reactor maps to mapping teardown.
+// The fault vocabulary is transport-agnostic: the byte-stream and datagram
+// semantics described in the scenario schema are the whole set, so the engine
+// emits only deliver/reorder-flush/connect actions for UDP too.
 
 #include <loki/reactor.hpp>
 
@@ -28,14 +27,12 @@
 #include <string>
 #include <utility>
 
-#include <loki/control.hpp>
 #include <loki/evidence.hpp>
 #include <loki/json.hpp>
 #include <loki/poller.hpp>
 #include <loki/scheduler.hpp>
 #include <loki/version.hpp>
 
-#include "../config/validate_transport.hpp"
 #include "../transport/socket_util.hpp"
 
 #ifdef LOKI_GIT_SHA
@@ -126,9 +123,6 @@ json::Value udp_connection_record(ConnId conn, const std::string& peer,
   rec.set("reason", json::Value::str(closed_reason_name(reason)));
   rec.set("bytes_a_to_b", json::Value::u(bytes_a_to_b));
   rec.set("bytes_b_to_a", json::Value::u(bytes_b_to_a));
-  // UDP is datagram-based and carries no TLS ClientHello, so SNI is always
-  // unknown; emit the field for schema consistency with the TCP reactor.
-  rec.set("sni", json::Value::str(std::string{}));
   return rec;
 }
 
@@ -174,8 +168,9 @@ class UdpReactor {
 };
 
 void UdpReactor::sync_down_read(TimeUs now) {
-  bool allow = mutator_->listener_enabled(now);
-  if (allow) {
+  (void)now;
+  bool allow = true;
+  {
     for (const auto& kv : conns_) {
       if (dir_full(kv.second.dir[static_cast<int>(Dir::AtoB)],
                    scenario_->limits.pending_bytes_per_direction)) {
@@ -292,10 +287,6 @@ void UdpReactor::process_chunk(UdpConn& c, Dir d, const char* buf, std::size_t n
       StreamKey{c.conn, d}, stats_before.bytes_seen,
       std::span<const std::byte>(reinterpret_cast<const std::byte*>(buf), n),
       stats_before, now);
-  // Advance the pristine logical offset exactly as if the datagram were
-  // delivered: blackhole discard still "consumes" the bytes (TCP ACKs into
-  // Loki), so downstream offsets stay consistent. Freeze cannot reach here for
-  // UDP (rejected at validation), so read_enabled false means discard.
   ds.stats.bytes_seen += n;
   ds.stats.chunks_seen += 1;
   if (d == Dir::AtoB)
@@ -303,9 +294,6 @@ void UdpReactor::process_chunk(UdpConn& c, Dir d, const char* buf, std::size_t n
   else
     summary_.bytes_b_to_a += n;
   c.last_activity = now;
-  if (!mutator_->read_enabled(StreamKey{c.conn, d}, now)) {
-    return;  // blackhole discard: drop the transformed output
-  }
   emit_pieces(c, d, std::move(pr), now);
 }
 
@@ -349,8 +337,6 @@ void UdpReactor::enqueue_piece(UdpConn& c, Dir d, OutPiece piece, TimeUs now) {
     sock::IoResult w = send_bytes(send_fd, d, c, piece.payload.data(),
                             piece.payload.size());
     if (w.n == static_cast<long>(piece.payload.size())) {
-      mutator_->on_data_flushed(StreamKey{c.conn, d},
-                                static_cast<std::uint64_t>(w.n), now);
       flush_direction(c, d, now);
       return;
     }
@@ -377,6 +363,7 @@ void UdpReactor::enqueue_piece(UdpConn& c, Dir d, OutPiece piece, TimeUs now) {
 }
 
 void UdpReactor::flush_direction(UdpConn& c, Dir d, TimeUs now) {
+  (void)now;  // kept for call-site symmetry with the TCP reactor
   UdpDirState& ds = c.dir[static_cast<int>(d)];
   const int fd = (d == Dir::AtoB) ? c.up_fd : down_fd_;
   if (fd < 0) {
@@ -397,7 +384,6 @@ void UdpReactor::flush_direction(UdpConn& c, Dir d, TimeUs now) {
       ds.empty_pending = false;
     }
   }
-  std::uint64_t flushed = 0;
   while (!ds.out.empty()) {
     UdpOutBlob& front = ds.out.front();
     const std::size_t remain = front.payload.size() - front.sent;
@@ -405,7 +391,6 @@ void UdpReactor::flush_direction(UdpConn& c, Dir d, TimeUs now) {
     if (w.n > 0) {
       front.sent += static_cast<std::size_t>(w.n);
       ds.pending_bytes -= static_cast<std::uint64_t>(w.n);
-      flushed += static_cast<std::uint64_t>(w.n);
       if (front.sent == front.payload.size()) ds.out.pop_front();
       continue;
     }
@@ -414,9 +399,6 @@ void UdpReactor::flush_direction(UdpConn& c, Dir d, TimeUs now) {
       break;
     }
     break;  // hard error: leave queued; teardown will reclaim
-  }
-  if (flushed > 0) {
-    mutator_->on_data_flushed(StreamKey{c.conn, d}, flushed, now);
   }
   if (ds.bp_paused &&
       ds.pending_bytes + ds.deferred_bytes <
@@ -530,40 +512,10 @@ void UdpReactor::execute_action(Scheduler::Due item, TimeUs now) {
     // UDP upstream is already connect()ed at mapping creation; nothing to do.
     return;
   }
-  if (auto* a = std::get_if<ActReset>(&item.action)) {
-    teardown_conn(a->conn, ClosedReason::FaultReset, now);
-    return;
-  }
-  if (auto* a = std::get_if<ActFin>(&item.action)) {
-    // UDP has no FIN; map to mapping teardown.
-    teardown_conn(a->conn, ClosedReason::ClientClosed, now);
-    return;
-  }
-  if (std::get_if<ActHalfCloseRx>(&item.action)) {
-    return;  // no RX shutdown for datagrams
-  }
-  if (auto* a = std::get_if<ActRefuseDownstream>(&item.action)) {
-    teardown_conn(a->conn, ClosedReason::ConnectFailed, now);
-    return;
-  }
-  if (std::holds_alternative<ActResumeListener>(item.action)) {
-    return;  // accept_stall is rejected for UDP; harmless no-op
-  }
-  if (std::get_if<ActIdleFire>(&item.action) != nullptr) {
-    // Forward to the engine: it re-arms stale fires, records the idle_timeout
-    // ledger decision, and schedules the configured action (ActReset /
-    // ActFin). The scheduled action is executed by the normal path below, which
-    // performs the mapping teardown. Closing here would both miss the decision
-    // and risk dropping an active mapping at an obsolete deadline.
-    ProcessResult pr = mutator_->on_engine_timer(item.action, now);
-    for (FaultDecision& d : pr.decisions) log_decision(std::move(d));
-    return;
-  }
-  // Engine-internal timers: reorder/coalesce flush release queued pieces.
+  // Engine-internal timers: reorder flush releases queued pieces.
   ProcessResult pr = mutator_->on_engine_timer(item.action, now);
   StreamKey key{};
   if (auto* fr = std::get_if<ActFlushReorder>(&item.action)) key = fr->key;
-  if (auto* fc = std::get_if<ActFlushCoalesce>(&item.action)) key = fc->key;
   if (key.conn == 0) return;
   auto it = conns_.find(key.conn);
   if (it != conns_.end()) emit_pieces(it->second, key.dir, std::move(pr), now);
@@ -655,9 +607,6 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
   sched_ = &scheduler;
   auto mutator = factory(config.scenario, scheduler, 0);
   mutator_ = mutator.get();
-  mutator_->set_decision_sink(
-      [this](FaultDecision d) { log_decision(std::move(d)); });
-
   int sig_fds[2];
   if (::pipe(sig_fds) != 0) throw std::runtime_error("udp reactor: pipe failed");
   sock::set_nonblock_cloexec(sig_fds[0]);
@@ -679,8 +628,6 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
   down_read_armed_ = true;
   (void)poller_->add(down_fd, Token{FdKind::Listener, 0}.raw(), PRead);
 
-  ControlServer control(store.control_socket_path());
-  (void)poller_->add(control.listen_fd(), Token{FdKind::Control, 0}.raw(), PRead);
 
   std::vector<PollEvent> events;
   std::vector<Scheduler::Due> due;
@@ -715,7 +662,6 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
 
     bool down_read_ready = false;
     bool down_write_ready = false;
-    bool control_ready = false;
     bool signal_ready = false;
     for (const PollEvent& ev : events) {
       const Token t = Token::from_raw(ev.token);
@@ -726,10 +672,6 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
       }
       if (t.kind == FdKind::Listener && t.conn == kSignalConnMarker) {
         signal_ready = true;
-        continue;
-      }
-      if (t.kind == FdKind::Control) {
-        control_ready = true;
         continue;
       }
       if (t.kind == FdKind::Upstream) {
@@ -759,15 +701,6 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
     scheduler.pop_due(steady_now_us(epoch), due);
     for (Scheduler::Due& item : due) {
       execute_action(std::move(item), steady_now_us(epoch));
-    }
-
-    if (control_ready) {
-      for (const ControlRequest& req : control.poll_requests()) {
-        ManualAction ma = ManualAction::Pause;
-        if (req.cmd == ControlCmd::Resume) ma = ManualAction::Resume;
-        if (req.cmd == ControlCmd::InjectReset) ma = ManualAction::InjectReset;
-        (void)mutator_->manual_action(ma, req.conn, steady_now_us(epoch));
-      }
     }
 
     // The shared downstream socket became writable: drain queued B-to-A
@@ -809,7 +742,6 @@ ReactorSummary UdpReactor::run(const ReactorConfig& config, MutatorFactory& fact
 }
 
 ReactorSummary run_proxy_udp(const ReactorConfig& config, MutatorFactory factory) {
-  check_transport_compat(config.scenario, TransportMode::Udp);
   ::signal(SIGPIPE, SIG_IGN);
   UdpReactor r;
   return r.run(config, factory);

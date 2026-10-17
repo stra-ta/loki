@@ -71,38 +71,14 @@ class PassthroughMutator final : public INetworkMutator {
   }
   void on_connection_established(ConnId, TimeUs) override {}
   void on_connection_closed(ConnId, TimeUs, ClosedReason) override {}
-  void on_data_flushed(const StreamKey&, std::uint64_t, TimeUs) override {}
 
-  bool read_enabled(const StreamKey&, TimeUs) override { return true; }
-  bool listener_enabled(TimeUs) override { return listener_enabled_; }
 
-  void set_decision_sink(DecisionSink sink) override { sink_ = std::move(sink); }
-  const std::vector<FaultDecision>& lifecycle_decisions() const override { return none_; }
-
-  bool manual_action(ManualAction action, ConnId conn, TimeUs now) override {
-    switch (action) {
-      case ManualAction::Pause:
-        listener_enabled_ = false;
-        return true;
-      case ManualAction::Resume:
-        listener_enabled_ = true;
-        sched_->push(now, ActResumeListener{});
-        return true;
-      case ManualAction::InjectReset:
-        sched_->push(now, ActReset{conn});
-        return true;
-    }
-    return false;
-  }
 
   ProcessResult on_engine_timer(const ScheduledAction&, TimeUs) override { return {}; }
 
  private:
   Scheduler* sched_ = nullptr;
   TimeUs epoch_ = 0;
-  DecisionSink sink_;
-  std::vector<FaultDecision> none_;
-  std::atomic<bool> listener_enabled_{true};
 };
 
 // Echo server: echoes everything back until the peer closes, then loops on

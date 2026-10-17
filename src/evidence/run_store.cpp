@@ -80,7 +80,7 @@ std::string pretty_dump(const json::Value& v) {
   if (frac < 0) { --secs; frac += 1000000; }
   std::tm tm{};
   gmtime_r(&secs, &tm);
-  char buf[40];
+  char buf[64];
   std::snprintf(buf, sizeof buf, "%04d-%02d-%02dT%02d:%02d:%02d.%06lldZ",
                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                 tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<long long>(frac));
@@ -161,7 +161,7 @@ FaultDecision decision_from_json(const json::Value& v) {
   std::string kind = require_str(v, "kind");
   // kind parsed back via the canonical names produced by kind_name().
   bool matched = false;
-  for (std::uint8_t k = 0; k <= static_cast<std::uint8_t>(FaultKind::IdleTimeout); ++k) {
+  for (std::uint8_t k = 0; k <= static_cast<std::uint8_t>(FaultKind::Corrupt); ++k) {
     auto fk = static_cast<FaultKind>(k);
     if (kind == kind_name(fk)) { d.kind = fk; matched = true; break; }
   }
@@ -202,7 +202,7 @@ RunStore RunStore::create(const std::string& runs_root,
   std::time_t secs = static_cast<std::time_t>(info.started_at / 1000000);
   std::tm tm{};
   gmtime_r(&secs, &tm);
-  char stamp[16];
+  char stamp[32];
   std::snprintf(stamp, sizeof stamp, "%04d%02d%02d-%02d%02d%02d",
                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                 tm.tm_hour, tm.tm_min, tm.tm_sec);
@@ -283,10 +283,6 @@ RunStore& RunStore::operator=(RunStore&& other) noexcept {
 const std::string& RunStore::run_dir() const {
   static const std::string empty;
   return impl_ ? impl_->run_dir : empty;
-}
-
-std::string RunStore::control_socket_path() const {
-  return run_dir() + "/control.sock";
 }
 
 RunStore::EventLog& RunStore::events() { return event_log_; }

@@ -51,7 +51,7 @@ class KqueuePoller final : public Poller {
     } while (n < 0 && errno == EINTR);
     if (n <= 0) return 0;
     for (int i = 0; i < n; ++i) {
-      const struct kevent& ke = events_[i];
+      const struct kevent& ke = events_[static_cast<std::size_t>(i)];
       PollEvent pe;
       pe.token = reinterpret_cast<std::uintptr_t>(ke.udata);  // token round-trips raw
       if (ke.flags & EV_ERROR) pe.err = true;

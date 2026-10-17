@@ -39,7 +39,7 @@ inline std::optional<Dir> dir_from_string(std::string_view s) {
 // Which socket leg of a proxied connection. Down faces the client, Up faces the server.
 enum class LegSide : std::uint8_t { Down = 0, Up = 1 };
 
-enum class FdKind : std::uint8_t { Listener = 0, Downstream = 1, Upstream = 2, Control = 3 };
+enum class FdKind : std::uint8_t { Listener = 0, Downstream = 1, Upstream = 2 };
 
 // Opaque token registered with the poller. Encoded to a single uint64.
 struct Token {
@@ -57,10 +57,8 @@ struct Token {
 enum class ClosedReason : std::uint8_t {
   ClientClosed,     // downstream peer closed the leg
   ServerClosed,     // upstream peer closed the leg
-  ConnectFailed,    // upstream connect error or refusal fault
-  FaultReset,       // reset fault or idle timeout with reset action
-  IdleTimeout,
-  ShutdownRequested // operator stop / control shutdown
+  ConnectFailed,    // upstream connect error
+  ShutdownRequested // operator stop
 };
 
 inline const char* closed_reason_name(ClosedReason r) {
@@ -68,8 +66,6 @@ inline const char* closed_reason_name(ClosedReason r) {
     case ClosedReason::ClientClosed: return "client_closed";
     case ClosedReason::ServerClosed: return "server_closed";
     case ClosedReason::ConnectFailed: return "connect_failed";
-    case ClosedReason::FaultReset: return "fault_reset";
-    case ClosedReason::IdleTimeout: return "idle_timeout";
     case ClosedReason::ShutdownRequested: return "shutdown_requested";
   }
   return "unknown";

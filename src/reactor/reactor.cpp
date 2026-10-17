@@ -1,5 +1,5 @@
 // Reactor: the single-threaded event loop that owns sockets, the scheduler,
-// the mutator, evidence, and the control plane.
+// the mutator, and evidence.
 //
 // Loop shape (INVARIANT, deterministic ordering):
 //   1. Poller wait with timeout = time until next scheduler deadline.
@@ -11,7 +11,6 @@
 //   4. Pop all due scheduler actions in (deadline, seq) order and execute.
 //   5. Backpressure: a direction with pending bytes >= limits stops reading
 //      its source socket (read arming off) until it drains below the bound.
-//   6. Control requests drain between steps 4 and 5.
 
 #include <loki/reactor.hpp>
 
@@ -31,16 +30,13 @@
 #include <utility>
 #include <vector>
 
-#include <loki/control.hpp>
 #include <loki/evidence.hpp>
 #include <loki/json.hpp>
 #include <loki/poller.hpp>
 #include <loki/scheduler.hpp>
 #include <loki/version.hpp>
 
-#include "../config/validate_transport.hpp"
 #include "../transport/socket_util.hpp"
-#include "../transport/tls_client_hello.hpp"
 
 #ifdef LOKI_GIT_SHA
 #define LOKI_SHA LOKI_GIT_SHA
@@ -96,14 +92,6 @@ struct ConnState {
   bool established = false;
   bool downstream_eof_pending = false;  // client FIN seen before upstream ready
   DirectionState dir[2];                // indexed by Dir: [AtoB, BtoA]
-
-  // TLS-aware tunneling: SNI is extracted from the client's ClientHello by
-  // inspecting (not decrypting) the A->B byte stream. `sni_done` marks that the
-  // ClientHello decision is settled (found / absent / not-TLS); `sni_stage`
-  // buffers bytes until the parser can decide; `sni` holds the result.
-  bool sni_done = false;
-  std::vector<std::byte> sni_stage;
-  std::string sni;
 };
 
 Dir inbound_dir(LegSide s) { return s == LegSide::Down ? Dir::AtoB : Dir::BtoA; }
@@ -127,8 +115,7 @@ Token leg_token(LegSide s, ConnId conn) {
 json::Value connection_record(ConnId conn, const std::string& peer,
                               WallUs opened_at, ClosedReason reason,
                               std::uint64_t bytes_a_to_b,
-                              std::uint64_t bytes_b_to_a,
-                              const std::string& sni) {
+                              std::uint64_t bytes_b_to_a) {
   json::Value rec = json::Value::object();
   rec.set("connection", json::Value::u(conn));
   rec.set("peer", json::Value::str(peer));
@@ -138,7 +125,6 @@ json::Value connection_record(ConnId conn, const std::string& peer,
   rec.set("reason", json::Value::str(closed_reason_name(reason)));
   rec.set("bytes_a_to_b", json::Value::u(bytes_a_to_b));
   rec.set("bytes_b_to_a", json::Value::u(bytes_b_to_a));
-  rec.set("sni", json::Value::str(sni));
   return rec;
 }
 
@@ -187,7 +173,6 @@ class Reactor {
   const CompiledScenario* scenario_ = nullptr;
   std::map<ConnId, ConnState> conns_;  // keyed by ordinal for sorted iteration
   ConnId next_conn_ = 0;
-  bool accepts_resumed_ = true;        // cleared by ActResumeListener
   bool stop_requested_ = false;
   ReactorSummary summary_{};
   std::map<std::uint32_t, std::uint64_t> rule_firings_;  // sampling bookkeeping
@@ -231,13 +216,11 @@ void Reactor::enqueue_piece(ConnState& c, Dir d, OutPiece piece, TimeUs now) {
     const std::size_t size = piece.payload.size();
     const sock::IoResult w = sock::write_some(fd, piece.payload.data(), size);
     if (w.n == static_cast<long>(size)) {
-      mutator_->on_data_flushed(StreamKey{c.conn, d}, size, now);
       flush_direction(c, d, now);  // backpressure release and teardown checks
       return;
     }
     if (w.n > 0) {
       const std::size_t sent = static_cast<std::size_t>(w.n);
-      mutator_->on_data_flushed(StreamKey{c.conn, d}, sent, now);
       OutBlob blob;
       blob.logical_offset = piece.logical_offset;
       blob.payload = std::move(piece.payload);
@@ -283,7 +266,6 @@ void Reactor::flush_direction(ConnState& c, Dir d, TimeUs now) {
   // WRITE->READ filter transition makes the READ filter never report, hanging
   // the connection. Always wait for the connect to finish.
   if (fd >= 0 && !c.connecting) {
-    std::uint64_t flushed = 0;
     while (!ds.out.empty()) {
       OutBlob& front = ds.out.front();
       const std::size_t remain = front.payload.size() - front.sent;
@@ -292,7 +274,6 @@ void Reactor::flush_direction(ConnState& c, Dir d, TimeUs now) {
       if (w.n > 0) {
         front.sent += static_cast<std::size_t>(w.n);
         ds.pending_bytes -= static_cast<std::uint64_t>(w.n);
-        flushed += static_cast<std::uint64_t>(w.n);
         if (front.sent == front.payload.size()) ds.out.pop_front();
         continue;
       }
@@ -305,7 +286,6 @@ void Reactor::flush_direction(ConnState& c, Dir d, TimeUs now) {
       }
       break;  // hard error: lifecycle paths clean up
     }
-    if (flushed > 0) mutator_->on_data_flushed(StreamKey{c.conn, d}, flushed, now);
   }
   // Backpressure release: re-arm reads once drained below the bound.
   if (ds.bp_paused &&
@@ -355,34 +335,6 @@ void Reactor::read_leg(ConnState& c, Dir d, TimeUs now) {
       return;
     }
      const std::size_t n = static_cast<std::size_t>(r.n);
-     // TLS-aware tunneling: inspect (never decrypt) the client's ClientHello to
-     // extract SNI so fault rules can match `when.sni`. Buffered until the
-     // parser can decide; the bytes are still forwarded verbatim below.
-     if (d == Dir::AtoB && !c.sni_done) {
-       const std::byte* base = reinterpret_cast<const std::byte*>(buf);
-       if (n > loki::tls::kMaxClientHelloBytes -
-                   std::min(c.sni_stage.size(), loki::tls::kMaxClientHelloBytes)) {
-         // Keep a malicious or unusual prefix from growing the per-connection
-         // inspection buffer without bound. The stream remains transparent.
-         c.sni_done = true;
-       } else {
-         c.sni_stage.insert(c.sni_stage.end(), base, base + n);
-         std::string extracted;
-         const loki::tls::ClientHelloStatus st = loki::tls::parse_client_hello_sni(
-             std::span<const std::byte>(c.sni_stage.data(), c.sni_stage.size()),
-             extracted);
-         if (st == loki::tls::ClientHelloStatus::Found) {
-           c.sni = std::move(extracted);
-           c.sni_done = true;
-           mutator_->on_connection_sni(c.conn, c.sni, now);
-         } else if (st == loki::tls::ClientHelloStatus::Incomplete) {
-           if (c.sni_stage.size() >= loki::tls::kMaxClientHelloBytes) c.sni_done = true;
-         } else {
-           // NotTls or NoSni: no usable SNI for this connection.
-           c.sni_done = true;
-         }
-       }
-     }
      // Offset invariant: offset of this chunk's first pristine byte.
     const StreamStats stats_before = ds.stats;  // passed BY VALUE
     ProcessResult pr = mutator_->process_read(
@@ -454,7 +406,7 @@ bool Reactor::graceful_teardown_if_done(ConnState& c, TimeUs now) {
   sched_->drop_connection(c.conn);
   store_->log_connection(connection_record(
       c.conn, c.peer, c.opened_at, reason, c.dir[0].stats.bytes_seen,
-      c.dir[1].stats.bytes_seen, c.sni));
+      c.dir[1].stats.bytes_seen));
   mutator_->on_connection_closed(c.conn, now, reason);
   conns_.erase(c.conn);
   return true;
@@ -475,7 +427,7 @@ void Reactor::rst_teardown(ConnState& c, ClosedReason reason, TimeUs now) {
   sched_->drop_connection(c.conn);
   store_->log_connection(connection_record(
       c.conn, c.peer, c.opened_at, reason, c.dir[0].stats.bytes_seen,
-      c.dir[1].stats.bytes_seen, c.sni));
+      c.dir[1].stats.bytes_seen));
   mutator_->on_connection_closed(c.conn, now, reason);
   conns_.erase(c.conn);
 }
@@ -531,9 +483,6 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
   sched_ = &scheduler;
   auto mutator = factory(config.scenario, scheduler, 0);
   mutator_ = mutator.get();
-  mutator_->set_decision_sink(
-      [this](FaultDecision d) { log_decision(std::move(d)); });
-
   // --- signal self-pipe ------------------------------------------------------
   int sig_fds[2];
   if (::pipe(sig_fds) != 0) throw std::runtime_error("reactor: pipe failed");
@@ -553,16 +502,11 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
   // --- listener --------------------------------------------------------------
   (void)poller_->add(listen_fd, Token{FdKind::Listener, 0}.raw(), PRead);
 
-  // --- control plane ---------------------------------------------------------
-  ControlServer control(store.control_socket_path());
-  (void)poller_->add(control.listen_fd(), Token{FdKind::Control, 0}.raw(), PRead);
-
   std::vector<PollEvent> events;
   std::vector<Scheduler::Due> due;
 
   auto accept_new = [&](TimeUs now) {
-       while (!stop_requested_ && accepts_resumed_ &&
-           mutator_->listener_enabled(now) &&
+    while (!stop_requested_ &&
            conns_.size() < config.scenario.limits.max_connections) {
       std::string peer;
       const int cfd = sock::tcp_accept(listen_fd, &peer);
@@ -577,7 +521,8 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
       dir_of(conns_[conn], Dir::AtoB).read_armed =
           poller_->add(cfd, leg_token(LegSide::Down, conn).raw(), PRead);
       ++summary_.connections_total;
-      // INVARIANT: the MUTATOR schedules ActConnectUpstream/ActRefuseDownstream.
+      // INVARIANT: the MUTATOR schedules ActConnectUpstream (exactly one per
+      // accepted connection); the reactor never connects on its own.
       mutator_->on_connection_accepted(conn, now);
     }
   };
@@ -597,35 +542,6 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
       flush_direction(c, a->key.dir, now);
       return;
     }
-    if (auto* a = std::get_if<ActFin>(&item.action)) {
-      const auto it = conns_.find(a->conn);
-      if (it == conns_.end()) return;
-      ConnState& c = it->second;
-      const int fd = leg_fd(c, a->leg);
-      if (fd >= 0) sock::shutdown_write(fd);
-      dir_of(c, outbound_dir(a->leg)).fin_relayed = true;
-      // Same macOS constraint as the PWrite drain path: drop EVFILT_WRITE
-      // once write interest ends so the READ knote keeps firing.
-      sync_leg_events(c, a->leg);
-      graceful_teardown_if_done(c, now);
-      return;
-    }
-    if (auto* a = std::get_if<ActHalfCloseRx>(&item.action)) {
-      const auto it = conns_.find(a->conn);
-      if (it == conns_.end()) return;
-      ConnState& c = it->second;
-      const int fd = leg_fd(c, a->leg);
-      if (fd >= 0) sock::shutdown_read(fd);
-      dir_of(c, inbound_dir(a->leg)).rx_shutdown = true;
-      disarm_read(c, inbound_dir(a->leg));
-      return;
-    }
-    if (auto* a = std::get_if<ActReset>(&item.action)) {
-      const auto it = conns_.find(a->conn);
-      if (it == conns_.end()) return;
-      rst_teardown(it->second, ClosedReason::FaultReset, now);
-      return;
-    }
     if (auto* a = std::get_if<ActConnectUpstream>(&item.action)) {
       const auto it = conns_.find(a->conn);
       if (it == conns_.end()) return;
@@ -635,39 +551,11 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
       (void)poller_->add(c.up_fd, leg_token(LegSide::Up, c.conn).raw(), PWrite);
       return;
     }
-    if (auto* a = std::get_if<ActRefuseDownstream>(&item.action)) {
-      const auto it = conns_.find(a->conn);
-      if (it == conns_.end()) return;
-      ConnState& c = it->second;
-      ++summary_.refused_total;
-      if (c.down_fd >= 0) {
-        (void)poller_->del(c.down_fd);
-        ::close(c.down_fd);
-        c.down_fd = -1;
-      }
-      sched_->drop_connection(a->conn);
-      store_->log_connection(connection_record(a->conn, c.peer, c.opened_at,
-                                               ClosedReason::ConnectFailed, 0, 0,
-                                               c.sni));
-      mutator_->on_connection_closed(a->conn, now, ClosedReason::ConnectFailed);
-      conns_.erase(a->conn);
-      return;
-    }
-    if (std::holds_alternative<ActResumeListener>(item.action)) {
-      accepts_resumed_ = true;
-      return;
-    }
     // Engine-internal timers forward to the mutator; released pieces are
     // processed like process_read pieces.
     ProcessResult pr = mutator_->on_engine_timer(item.action, now);
     StreamKey key{};
     if (auto* fr = std::get_if<ActFlushReorder>(&item.action)) key = fr->key;
-    if (auto* fc = std::get_if<ActFlushCoalesce>(&item.action)) key = fc->key;
-    if (std::get_if<ActIdleFire>(&item.action) != nullptr) {
-      // IdleFire carries only a conn id; released pieces (if any) have no
-      // single direction, so decisions flow through the sink instead.
-      return;
-    }
     const auto it = conns_.find(key.conn);
     if (it != conns_.end()) emit_pieces(it->second, key.dir, std::move(pr), now);
   };
@@ -705,7 +593,6 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
               });
 
     bool listener_ready = false;
-    bool control_ready = false;
     bool signal_ready = false;
     for (const PollEvent& ev : events) {
       const Token t = Token::from_raw(ev.token);
@@ -714,9 +601,6 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
       }
       if (t.kind == FdKind::Listener && t.conn == kSignalConnMarker) {
         signal_ready = true;        continue;
-      }
-      if (t.kind == FdKind::Control) {
-        control_ready = true;        continue;
       }
            const auto it = conns_.find(t.conn);
       if (it == conns_.end()) continue;
@@ -788,16 +672,6 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
       execute_action(std::move(item), steady_now_us(epoch));
     }
 
-    // Step 6: control requests drain between steps 4 and 5.
-    if (control_ready) {
-      for (const ControlRequest& req : control.poll_requests()) {
-        ManualAction ma = ManualAction::Pause;
-        if (req.cmd == ControlCmd::Resume) ma = ManualAction::Resume;
-        if (req.cmd == ControlCmd::InjectReset) ma = ManualAction::InjectReset;
-        (void)mutator_->manual_action(ma, req.conn, steady_now_us(epoch));
-      }
-    }
-
     if (listener_ready) accept_new(steady_now_us(epoch));
 
     if (signal_ready) {
@@ -855,7 +729,6 @@ ReactorSummary Reactor::run(const ReactorConfig& config, MutatorFactory& factory
 ReactorSummary run_proxy(const ReactorConfig& config, MutatorFactory factory) {
   // Transport compatibility is enforced at the public entry point so that direct
   // API callers cannot run TCP-only faults through UDP either.
-  check_transport_compat(config.scenario, config.transport);
   // Writes race peer closes constantly in a proxy; EPIPE must surface as a
   // write error, not a process kill.
   ::signal(SIGPIPE, SIG_IGN);

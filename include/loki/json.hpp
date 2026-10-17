@@ -24,7 +24,8 @@ inline std::string escape(std::string_view s) {
   std::string out;
   out.reserve(s.size() + 2);
   out += '"';
-  for (const unsigned char c : s) {
+  for (const char raw : s) {
+    const auto c = static_cast<unsigned char>(raw);
     switch (c) {
       case '"': out += "\\\""; break;
       case '\\': out += "\\\\"; break;

@@ -12,7 +12,6 @@
 //     connections.jsonl        (lifecycle records per connection)
 //     metrics.json             (counters snapshot at finish)
 //     summary.json             (final aggregates)
-//     control.sock             (unix domain socket, removed on clean exit)
 
 #include <cstdio>
 #include <memory>
@@ -67,7 +66,6 @@ class RunStore {
  public:
 
   const std::string& run_dir() const;
-  std::string control_socket_path() const;
 
   // Streaming decision ledger. Sampling policy is applied by callers
   // (the engine knows each rule's LedgerMode); this writer records everything

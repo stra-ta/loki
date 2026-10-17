@@ -11,9 +11,8 @@
 //     decisions at their recorded logical positions without drawing RNG.
 //
 // Connect initiation (INVARIANT): implementations MUST schedule exactly one
-// of ActConnectUpstream (immediate or delayed) or ActRefuseDownstream per
-// accepted connection from on_connection_accepted(). The reactor never opens
-// the upstream socket on its own initiative.
+// ActConnectUpstream per accepted connection from on_connection_accepted().
+// The reactor never opens the upstream socket on its own initiative.
 //
 // Deterministic draw order (INVARIANT): within one process_read call, rules
 // evaluate in ascending index; each rule consumes RNG only when its match
@@ -66,11 +65,9 @@ struct OutPiece {
 };
 
 struct ProcessResult {
-  std::vector<OutPiece> pieces;       // may be empty (discarded/blackholed)
+  std::vector<OutPiece> pieces;       // may be empty (e.g., held by reorder)
   std::vector<FaultDecision> decisions;
 };
-
-enum class ManualAction : std::uint8_t { Pause, Resume, InjectReset };
 
 class INetworkMutator {
  public:
@@ -91,38 +88,10 @@ class INetworkMutator {
   virtual void on_connection_established(ConnId conn, TimeUs now) = 0;
   virtual void on_connection_closed(ConnId conn, TimeUs now, ClosedReason reason) = 0;
 
-  // Reports the TLS SNI extracted from a connection's ClientHello in TLS-aware
-  // tunneling mode (no decryption). Engines may use it for `when.sni` matching.
-  // Default no-op so existing mutators need not implement it.
-  virtual void on_connection_sni(ConnId conn, std::string sni, TimeUs now) {
-    (void)conn;
-    (void)sni;
-    (void)now;
-  }
-
-  // Bytes actually hit the wire on the far leg (used by token bucket).
-  virtual void on_data_flushed(const StreamKey& key, std::uint64_t bytes, TimeUs now) = 0;
-
-  // Flow-control queries consulted by the reactor before arming reads.
-  virtual bool read_enabled(const StreamKey& key, TimeUs now) = 0;    // freeze support
-  virtual bool listener_enabled(TimeUs now) = 0;                      // accept_stall / pause
-
-  // Lifecycle event sink for evidence; set by the reactor before use.
-  // Decisions produced via process_read are collected by the reactor from
-  // ProcessResult; lifecycle decisions go through this sink as they happen.
-  using DecisionSink = std::function<void(FaultDecision)>;
-  virtual void set_decision_sink(DecisionSink sink) = 0;
-
-  // Summary aggregation for evidence (fault counts by kind name).
-  virtual const std::vector<FaultDecision>& lifecycle_decisions() const = 0;
-
-  // Operator/manual action hook (control socket). Returns true when handled.
-  virtual bool manual_action(ManualAction action, ConnId conn, TimeUs now) = 0;
-
   // A scheduler action originated by this mutator surfaced (engine-internal
-  // timers: ActFlushReorder, ActFlushCoalesce, ActIdleFire). The reactor
-  // forwards these here instead of executing them mechanically. Returns any
-  // pieces released (e.g., flushed reorder/coalesce buffers).
+  // timers: ActFlushReorder). The reactor forwards these here instead of
+  // executing them mechanically. Returns any pieces released (e.g., flushed
+  // reorder buffers).
   virtual ProcessResult on_engine_timer(const ScheduledAction& origin, TimeUs now) = 0;
 
   // Whether the engine still expects to make progress. Consulted only by

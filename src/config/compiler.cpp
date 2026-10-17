@@ -94,12 +94,6 @@ struct ParsedFault {
   FaultParams params{};
 };
 
-LegSide leg_from_side(const YNode& n) {
-  if (n.scalar == "client") return LegSide::Down;
-  if (n.scalar == "server") return LegSide::Up;
-  err("side must be 'client' or 'server'", n.line);
-}
-
 ParsedFault parse_inject(const YNode& inject) {
   expect_map(inject, "inject");
   if (inject.map.size() != 1) err("inject must contain exactly one fault key", inject.line);
@@ -165,19 +159,6 @@ ParsedFault parse_inject(const YNode& inject) {
     if (p.max_bytes < p.min_bytes) err("fragment.max must be >= min", mx->line);
     return {FaultKind::Fragment, p};
   }
-  if (key == "coalesce") {
-    allow_keys(val, {"size", "max_delay"}, "coalesce");
-    CoalesceParams p;
-    const YNode* size = val.find("size");
-    const YNode* delay = val.find("max_delay");
-    if (!size || !delay) err("coalesce requires 'size' and 'max_delay'", val.line);
-    expect_scalar(*size, "coalesce.size");
-    expect_scalar(*delay, "coalesce.max_delay");
-    p.size_bytes = as_uint(*size, "coalesce.size");
-    if (p.size_bytes < 1) err("coalesce.size must be >= 1", size->line);
-    p.max_delay_us = as_duration_us(*delay, "coalesce.max_delay");
-    return {FaultKind::Coalesce, p};
-  }
   if (key == "reorder") {
     allow_keys(val, {"depth", "max_hold"}, "reorder");
     ReorderParams p;
@@ -224,99 +205,6 @@ ParsedFault parse_inject(const YNode& inject) {
     p.value = static_cast<std::uint8_t>(v);
     return {FaultKind::Corrupt, p};
   }
-  if (key == "blackhole") {
-    allow_keys(val, {"direction", "mode", "duration"}, "blackhole");
-    BlackholeParams p;
-    const YNode* dir = val.find("direction");
-    const YNode* mode = val.find("mode");
-    if (!dir || !mode) err("blackhole requires 'direction' and 'mode'", val.line);
-    expect_scalar(*dir, "blackhole.direction");
-    expect_scalar(*mode, "blackhole.mode");
-    p.dir = as_dir(*dir, "blackhole.direction");
-    if (mode->scalar == "discard") p.mode = BlackholeParams::Mode::Discard;
-    else if (mode->scalar == "freeze") p.mode = BlackholeParams::Mode::Freeze;
-    else err("blackhole.mode must be 'discard' or 'freeze'", mode->line);
-    if (const YNode* dur = val.find("duration")) {
-      expect_scalar(*dur, "blackhole.duration");
-      p.duration_us = as_duration_us(*dur, "blackhole.duration");
-    }
-    return {FaultKind::Blackhole, p};
-  }
-  if (key == "reset") {
-    allow_keys(val, {"after"}, "reset");
-    ResetParams p;
-    if (const YNode* after = val.find("after")) {
-      expect_scalar(*after, "reset.after");
-      p.after_us = as_duration_us(*after, "reset.after");
-    }
-    return {FaultKind::Reset, p};
-  }
-  if (key == "fin") {
-    allow_keys(val, {"side"}, "fin");
-    HalfCloseParams p;  // Mode::Tx sugar
-    const YNode* side = val.find("side");
-    if (!side) err("fin requires 'side'", val.line);
-    expect_scalar(*side, "fin.side");
-    p.leg = leg_from_side(*side);
-    return {FaultKind::HalfClose, p};
-  }
-  if (key == "half_close") {
-    allow_keys(val, {"side", "mode"}, "half_close");
-    HalfCloseParams p;
-    const YNode* side = val.find("side");
-    if (!side) err("half_close requires 'side'", val.line);
-    expect_scalar(*side, "half_close.side");
-    p.leg = leg_from_side(*side);
-    if (const YNode* mode = val.find("mode")) {
-      expect_scalar(*mode, "half_close.mode");
-      if (mode->scalar == "tx") p.mode = HalfCloseParams::Mode::Tx;
-      else if (mode->scalar == "rx") p.mode = HalfCloseParams::Mode::Rx;
-      else err("half_close.mode must be 'tx' or 'rx'", mode->line);
-    }
-    return {FaultKind::HalfClose, p};
-  }
-  if (key == "connect_delay") {
-    allow_keys(val, {"delay"}, "connect_delay");
-    ConnectDelayParams p;
-    const YNode* delay = val.find("delay");
-    if (!delay) err("connect_delay requires 'delay'", val.line);
-    expect_scalar(*delay, "connect_delay.delay");
-    p.delay_us = as_duration_us(*delay, "connect_delay.delay");
-    return {FaultKind::ConnectDelay, p};
-  }
-  if (key == "refuse") {
-    allow_keys(val, {"after"}, "refuse");
-    RefuseParams p;
-    if (const YNode* after = val.find("after")) {
-      expect_scalar(*after, "refuse.after");
-      p.after_us = as_duration_us(*after, "refuse.after");
-    }
-    return {FaultKind::Refuse, p};
-  }
-  if (key == "accept_stall") {
-    allow_keys(val, {"stall"}, "accept_stall");
-    AcceptStallParams p;
-    const YNode* stall = val.find("stall");
-    if (!stall) err("accept_stall requires 'stall'", val.line);
-    expect_scalar(*stall, "accept_stall.stall");
-    p.stall_us = as_duration_us(*stall, "accept_stall.stall");
-    return {FaultKind::AcceptStall, p};
-  }
-  if (key == "idle_timeout") {
-    allow_keys(val, {"idle", "action"}, "idle_timeout");
-    IdleTimeoutParams p;
-    const YNode* idle = val.find("idle");
-    if (!idle) err("idle_timeout requires 'idle'", val.line);
-    expect_scalar(*idle, "idle_timeout.idle");
-    p.idle_us = as_duration_us(*idle, "idle_timeout.idle");
-    if (const YNode* action = val.find("action")) {
-      expect_scalar(*action, "idle_timeout.action");
-      if (action->scalar == "reset") p.action = IdleTimeoutParams::Action::Reset;
-      else if (action->scalar == "fin") p.action = IdleTimeoutParams::Action::Fin;
-      else err("idle_timeout.action must be 'reset' or 'fin'", action->line);
-    }
-    return {FaultKind::IdleTimeout, p};
-  }
   err("unknown inject fault '" + key + "'", inject.line);
 }
 
@@ -328,7 +216,7 @@ MatchSpec parse_when(const YNode& when) {
   expect_map(when, "when");
   allow_keys(when,
               {"direction", "after", "every_bytes", "every_events", "connection",
-               "probability", "max_occurrences", "min_stream_offset", "sni"},
+               "probability", "max_occurrences", "min_stream_offset"},
               "when");
   MatchSpec m;
   if (const YNode* n = when.find("direction")) {
@@ -358,10 +246,6 @@ MatchSpec parse_when(const YNode& when) {
   }
   if (const YNode* n = when.find("max_occurrences")) m.max_occurrences = as_uint(*n, "when.max_occurrences");
   if (const YNode* n = when.find("min_stream_offset")) m.min_stream_offset = as_uint(*n, "when.min_stream_offset");
-  if (const YNode* n = when.find("sni")) {
-    expect_scalar(*n, "when.sni");
-    m.sni = n->scalar;
-  }
   return m;
 }
 
@@ -403,17 +287,9 @@ FaultKind kind_of(const FaultParams& p) {
     case 0: return FaultKind::Latency;
     case 1: return FaultKind::Bandwidth;
     case 2: return FaultKind::Fragment;
-    case 3: return FaultKind::Coalesce;
-    case 4: return FaultKind::Reorder;
-    case 5: return FaultKind::Duplicate;
-    case 6: return FaultKind::Corrupt;
-    case 7: return FaultKind::Blackhole;
-    case 8: return FaultKind::Reset;
-    case 9: return FaultKind::HalfClose;
-    case 10: return FaultKind::ConnectDelay;
-    case 11: return FaultKind::Refuse;
-    case 12: return FaultKind::AcceptStall;
-    case 13: return FaultKind::IdleTimeout;
+    case 3: return FaultKind::Reorder;
+    case 4: return FaultKind::Duplicate;
+    case 5: return FaultKind::Corrupt;
   }
   return FaultKind::Latency;  // unreachable
 }
@@ -423,18 +299,9 @@ const char* kind_name(FaultKind k) {
     case FaultKind::Latency: return "latency";
     case FaultKind::Bandwidth: return "bandwidth";
     case FaultKind::Fragment: return "fragment";
-    case FaultKind::Coalesce: return "coalesce";
     case FaultKind::Reorder: return "reorder";
     case FaultKind::Duplicate: return "duplicate";
     case FaultKind::Corrupt: return "corrupt";
-    case FaultKind::Blackhole: return "blackhole";
-    case FaultKind::Reset: return "reset";
-    case FaultKind::Fin: return "fin";  // never produced by compile_scenario
-    case FaultKind::HalfClose: return "half_close";
-    case FaultKind::ConnectDelay: return "connect_delay";
-    case FaultKind::Refuse: return "refuse";
-    case FaultKind::AcceptStall: return "accept_stall";
-    case FaultKind::IdleTimeout: return "idle_timeout";
   }
   return "unknown";
 }
@@ -493,36 +360,6 @@ Value inject_json(const CompiledRule& r) {
         } else if constexpr (std::is_same_v<P, FragmentParams>) {
           add_u("max_bytes", p.max_bytes);
           add_u("min_bytes", p.min_bytes);
-        } else if constexpr (std::is_same_v<P, CoalesceParams>) {
-          add_u("max_delay_us", p.max_delay_us);
-          add_u("size_bytes", p.size_bytes);
-        } else if constexpr (std::is_same_v<P, ReorderParams>) {
-          add_u("depth", p.depth);
-          add_u("max_hold_us", p.max_hold_us);
-        } else if constexpr (std::is_same_v<P, DuplicateParams>) {
-          add_u("count", p.count);
-        } else if constexpr (std::is_same_v<P, CorruptParams>) {
-          add_s("mode", p.mode == CorruptParams::Mode::XorByte ? "xor" : "overwrite");
-          add_u("offset", p.stream_offset);
-          add_u("value", p.value);
-        } else if constexpr (std::is_same_v<P, BlackholeParams>) {
-          add_s("direction", dir_name(p.dir));
-          add_s("mode", p.mode == BlackholeParams::Mode::Discard ? "discard" : "freeze");
-          if (p.duration_us != 0) add_u("duration_us", p.duration_us);
-        } else if constexpr (std::is_same_v<P, ResetParams>) {
-          if (p.after_us != 0) add_u("after_us", p.after_us);
-        } else if constexpr (std::is_same_v<P, HalfCloseParams>) {
-          add_s("mode", p.mode == HalfCloseParams::Mode::Tx ? "tx" : "rx");
-          add_s("side", p.leg == LegSide::Down ? "client" : "server");
-        } else if constexpr (std::is_same_v<P, ConnectDelayParams>) {
-          add_u("delay_us", p.delay_us);
-        } else if constexpr (std::is_same_v<P, RefuseParams>) {
-          if (p.after_us != 0) add_u("after_us", p.after_us);
-        } else if constexpr (std::is_same_v<P, AcceptStallParams>) {
-          add_u("stall_us", p.stall_us);
-        } else if constexpr (std::is_same_v<P, IdleTimeoutParams>) {
-          add_s("action", p.action == IdleTimeoutParams::Action::Reset ? "reset" : "fin");
-          add_u("idle_us", p.idle_us);
         }
       },
       r.params);
@@ -546,7 +383,6 @@ Value when_json(const MatchSpec& w) {
     m.emplace_back("max_occurrences", Value::u(w.max_occurrences));
   }
   if (w.min_stream_offset != 0) m.emplace_back("min_stream_offset", Value::u(w.min_stream_offset));
-  if (!w.sni.empty()) m.emplace_back("sni", Value::str(w.sni));
   return sorted_object(std::move(m));
 }
 
@@ -654,17 +490,6 @@ CompiledScenario compile_scenario(const std::string& yaml_text) {
       ParsedFault f = parse_inject(*inject);
       cr.kind = f.kind;
       cr.params = f.params;
-
-      // SNI is only observable after the ClientHello is read (data phase).
-      // Connection/accept-phase faults act before any SNI exists, so combining
-      // them with when.sni yields an unreachable rule. Reject explicitly.
-      if (!cr.when.sni.empty() &&
-          (cr.kind == FaultKind::ConnectDelay || cr.kind == FaultKind::Refuse ||
-           cr.kind == FaultKind::AcceptStall)) {
-        err("when.sni cannot be combined with connection-phase faults "
-            "(connect_delay, refuse, accept_stall)",
-            rn.line);
-      }
 
       // Track explicit-vs-default name so normalized_json can omit defaults:
       // normalized_json derives this itself by comparing against "rule-N", so
