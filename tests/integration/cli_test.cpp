@@ -6,7 +6,9 @@
 // use short-lived runs signaled with SIGINT and check artifact completeness;
 // everything else uses fabricated or minimal run directories.
 
+#if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#endif
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -30,11 +32,6 @@ namespace {
 // Locate the loki executable relative to this test binary:
 // <build>/tests/integration/<test> lives next to <build>/src/cli/loki.
 std::string find_loki_binary() {
-  const std::vector<fs::path> candidates = {
-      fs::path("/proc/self/exe"),  // placeholder replaced below
-  };
-  (void)candidates;
-
   char buf[4096];
   std::string self;
 #if defined(__APPLE__)

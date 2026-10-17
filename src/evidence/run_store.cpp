@@ -80,7 +80,7 @@ std::string pretty_dump(const json::Value& v) {
   if (frac < 0) { --secs; frac += 1000000; }
   std::tm tm{};
   gmtime_r(&secs, &tm);
-  char buf[40];
+  char buf[64];
   std::snprintf(buf, sizeof buf, "%04d-%02d-%02dT%02d:%02d:%02d.%06lldZ",
                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                 tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<long long>(frac));
@@ -202,7 +202,7 @@ RunStore RunStore::create(const std::string& runs_root,
   std::time_t secs = static_cast<std::time_t>(info.started_at / 1000000);
   std::tm tm{};
   gmtime_r(&secs, &tm);
-  char stamp[16];
+  char stamp[32];
   std::snprintf(stamp, sizeof stamp, "%04d%02d%02d-%02d%02d%02d",
                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                 tm.tm_hour, tm.tm_min, tm.tm_sec);

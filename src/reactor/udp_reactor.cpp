@@ -384,7 +384,6 @@ void UdpReactor::flush_direction(UdpConn& c, Dir d, TimeUs now) {
       ds.empty_pending = false;
     }
   }
-  std::uint64_t flushed = 0;
   while (!ds.out.empty()) {
     UdpOutBlob& front = ds.out.front();
     const std::size_t remain = front.payload.size() - front.sent;
@@ -392,7 +391,6 @@ void UdpReactor::flush_direction(UdpConn& c, Dir d, TimeUs now) {
     if (w.n > 0) {
       front.sent += static_cast<std::size_t>(w.n);
       ds.pending_bytes -= static_cast<std::uint64_t>(w.n);
-      flushed += static_cast<std::uint64_t>(w.n);
       if (front.sent == front.payload.size()) ds.out.pop_front();
       continue;
     }
@@ -401,8 +399,6 @@ void UdpReactor::flush_direction(UdpConn& c, Dir d, TimeUs now) {
       break;
     }
     break;  // hard error: leave queued; teardown will reclaim
-  }
-  if (flushed > 0) {
   }
   if (ds.bp_paused &&
       ds.pending_bytes + ds.deferred_bytes <

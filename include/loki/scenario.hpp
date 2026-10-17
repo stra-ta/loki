@@ -157,7 +157,8 @@ struct CompiledScenario {
 
 class ScenarioError : public std::runtime_error {
  public:
-  ScenarioError(std::string msg, int line) : std::runtime_error(std::move(msg)), line(line) {}
+  ScenarioError(std::string msg, int line_number)
+      : std::runtime_error(std::move(msg)), line(line_number) {}
   int line = 0;  // 0 = not tied to a line
 };
 

@@ -21,8 +21,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#endif
 #include <random>
 #include <optional>
 #include <sstream>
@@ -50,12 +53,19 @@ constexpr int kExitOk = 0;
 constexpr auto kWaitTimeout = seconds(15);
 
 std::string self_path() {
+#if defined(__APPLE__)
   uint32_t size = 0;
   _NSGetExecutablePath(nullptr, &size);
   std::string buf(size, '\0');
   _NSGetExecutablePath(buf.data(), &size);
   buf.resize(std::strlen(buf.c_str()));
   return buf;
+#else
+  char buf[4096];
+  const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
+  if (n <= 0) return {};
+  return std::string(buf, static_cast<std::size_t>(n));
+#endif
 }
 
 std::string scenario_path(const std::string& name) {
@@ -263,7 +273,7 @@ bool wait_connectable(int port, clk::time_point deadline) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(port);
+    addr.sin_port = htons(static_cast<std::uint16_t>(port));
     int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
     ::close(fd);
     if (rc == 0) return true;
@@ -385,7 +395,7 @@ TEST_CASE("e2e: basic passthrough is byte-identical", "[integration][e2e]") {
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = htons(listen_port);
+  addr.sin_port = htons(static_cast<std::uint16_t>(listen_port));
   REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
 
   auto payload = random_bytes(0xAB1E, 64 * 1024);
@@ -433,7 +443,7 @@ TEST_CASE("e2e: fragment preserves byte stream", "[integration][e2e]") {
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = htons(listen_port);
+  addr.sin_port = htons(static_cast<std::uint16_t>(listen_port));
   REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
 
   auto payload = random_bytes(0xFACE, 64 * 1024);
@@ -470,7 +480,7 @@ TEST_CASE("e2e: latency delays delivery within expected bounds", "[integration][
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = htons(listen_port);
+  addr.sin_port = htons(static_cast<std::uint16_t>(listen_port));
   REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
 
   // One small message: RTT = sum of both directions, each 50ms +/- 20ms,
@@ -510,7 +520,7 @@ TEST_CASE("e2e: throttle caps throughput", "[integration][e2e]") {
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = htons(listen_port);
+  addr.sin_port = htons(static_cast<std::uint16_t>(listen_port));
   REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
 
   // 64 KiB at 50 KiB/s minus the 8 KiB burst takes >= ~1.12s.
@@ -552,7 +562,7 @@ TEST_CASE("e2e: deterministic replay produces identical ledger", "[integration][
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(listen_port);
+    addr.sin_port = htons(static_cast<std::uint16_t>(listen_port));
     REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
 
     // Identical workload in both runs so observed event order repeats.
@@ -615,7 +625,7 @@ TEST_CASE("e2e: ledger replay re-applies recorded decisions", "[integration][e2e
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = htons(listen_port);
+  addr.sin_port = htons(static_cast<std::uint16_t>(listen_port));
   REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
 
   auto payload = random_bytes(0xFACE, 16 * 1024);
@@ -662,7 +672,7 @@ TEST_CASE("e2e: ledger replay re-applies recorded decisions", "[integration][e2e
     sockaddr_in raddr{};
     raddr.sin_family = AF_INET;
     raddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    raddr.sin_port = htons(listen_port);
+    raddr.sin_port = htons(static_cast<std::uint16_t>(listen_port));
     REQUIRE(::connect(rfd, reinterpret_cast<sockaddr*>(&raddr), sizeof(raddr)) == 0);
     REQUIRE(send_all(rfd, payload.data(), payload.size()));
     std::vector<uint8_t> r_echoed(payload.size());

@@ -29,14 +29,15 @@ std::string as_string(const std::vector<std::byte>& v) {
 
 struct Harness {
   CompiledScenario sc;
-  // Leaked deliberately: guarantees stable, never-reused scheduler identity
-  // for the lifetime of the test binary.
-  Scheduler* sch = new Scheduler();
+  // Per-test scheduler with a stable identity for the harness lifetime; the
+  // mutator only borrows the pointer, and declaration order keeps the
+  // scheduler alive until after the engine is destroyed.
+  std::unique_ptr<Scheduler> sch = std::make_unique<Scheduler>();
   std::unique_ptr<INetworkMutator> eng;
 
   explicit Harness(const std::string& yaml, TimeUs epoch = 0)
       : sc(compile_scenario(yaml)), eng(make_live_fault_engine(sc)) {
-    eng->bind(sch, epoch);
+    eng->bind(sch.get(), epoch);
   }
 
   ProcessResult read(ConnId conn, Dir dir, std::uint64_t offset, const std::string& data,
