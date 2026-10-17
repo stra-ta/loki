@@ -59,20 +59,10 @@ TEST_CASE("every inject kind compiles", "[loki_config]") {
        FaultKind::Latency},
       {"bandwidth:\n          rate: 1000\n          burst: 4096", FaultKind::Bandwidth},
       {"fragment:\n          min: 2\n          max: 8", FaultKind::Fragment},
-      {"coalesce:\n          size: 512\n          max_delay: 3ms", FaultKind::Coalesce},
       {"reorder:\n          depth: 4\n          max_hold: 1ms", FaultKind::Reorder},
       {"duplicate:\n          count: 3", FaultKind::Duplicate},
       {"corrupt:\n          mode: xor\n          offset: 16\n          value: 255",
        FaultKind::Corrupt},
-      {"blackhole:\n          direction: b_to_a\n          mode: freeze\n          duration: 100ms",
-       FaultKind::Blackhole},
-      {"reset:\n          after: 250ms", FaultKind::Reset},
-      {"fin:\n          side: client", FaultKind::HalfClose},
-      {"half_close:\n          side: server\n          mode: rx", FaultKind::HalfClose},
-      {"connect_delay:\n          delay: 20ms", FaultKind::ConnectDelay},
-      {"refuse:\n          after: 1s", FaultKind::Refuse},
-      {"accept_stall:\n          stall: 500ms", FaultKind::AcceptStall},
-      {"idle_timeout:\n          idle: 30s\n          action: fin", FaultKind::IdleTimeout},
   };
   for (const auto& c : cases) {
     std::string yaml = std::string(kMinimal) + "\nrules:\n  - name: probe\n    inject:\n      " +
@@ -90,38 +80,16 @@ TEST_CASE("zero-field fault mapping defaults", "[loki_config]") {
   const auto sc = compile_scenario(std::string(kMinimal) + R"(
 rules:
   - inject:
-      reset:
+      duplicate:
 )");
   REQUIRE(sc.rules.size() == 1);
-  REQUIRE(std::get<ResetParams>(sc.rules[0].params).after_us == 0);
-}
-
-TEST_CASE("fin sugar maps to half_close tx with leg from side", "[loki_config]") {
-  const auto client = compile_scenario(std::string(kMinimal) + R"(
-rules:
-  - inject:
-      fin:
-        side: client
-)");
-  REQUIRE(client.rules[0].kind == FaultKind::HalfClose);
-  auto p = std::get<HalfCloseParams>(client.rules[0].params);
-  REQUIRE(p.mode == HalfCloseParams::Mode::Tx);
-  REQUIRE(p.leg == LegSide::Down);
-
-  const auto server = compile_scenario(std::string(kMinimal) + R"(
-rules:
-  - inject:
-      fin:
-        side: server
-)");
-  p = std::get<HalfCloseParams>(server.rules[0].params);
-  REQUIRE(p.leg == LegSide::Up);
+  REQUIRE(std::get<DuplicateParams>(sc.rules[0].params).count == 1);
 }
 
 TEST_CASE("direction aliases resolve", "[loki_config]") {
   for (const char* alias : {"a_to_b", "client_to_server", "c2s"}) {
     const auto sc = compile_scenario(std::string(kMinimal) + std::string("\nrules:\n  - when:\n      direction: ") +
-                                     alias + "\n    inject:\n      reset:\n");
+                                     alias + "\n    inject:\n      duplicate:\n");
     REQUIRE(sc.rules[0].when.direction == Dir::AtoB);
   }
   const auto sc = compile_scenario(std::string(kMinimal) + R"(
@@ -129,7 +97,7 @@ rules:
   - when:
       direction: s2c
     inject:
-      reset:
+      duplicate:
 )");
   REQUIRE(sc.rules[0].when.direction == Dir::BtoA);
 }
@@ -222,7 +190,7 @@ rules:
   - when:
       probability: 1.5
     inject:
-      reset:
+      duplicate:
 )";
   REQUIRE_THROWS_AS(compile_scenario(over), ScenarioError);
   const std::string under = std::string(kMinimal) + R"(
@@ -230,7 +198,7 @@ rules:
   - when:
       probability: -0.1
     inject:
-      reset:
+      duplicate:
 )";
   REQUIRE_THROWS_AS(compile_scenario(under), ScenarioError);
 }
@@ -253,7 +221,7 @@ TEST_CASE("range validations enforced", "[loki_config]") {
                              "\nrules:\n  - inject:\n      corrupt:\n        mode: xor\n        offset: 0\n        value: 256")
               .find("value") != std::string::npos);
   REQUIRE(compile_error_line(std::string(kMinimal) +
-                             "\nrules:\n  - ledger: sample:0\n    inject:\n      reset:")
+                             "\nrules:\n  - ledger: sample:0\n    inject:\n      duplicate:")
               .find("sample") != std::string::npos);
   REQUIRE(compile_error_line(std::string(kMinimal) +
                              "\nrules:\n  - inject:\n      latency:\n        mean: 5ms\n        distribution: normal\n        stddev: 0us")
@@ -345,17 +313,16 @@ TEST_CASE("defaulted keys omitted from normalized json", "[loki_config]") {
   const std::string j = normalized_json(compile_scenario(std::string(kMinimal) + R"(
 rules:
   - inject:
-      blackhole:
-        direction: a_to_b
-        mode: discard
+      fragment:
+        min: 1
+        max: 2
 )"));
-  // Default rule name omitted; Full ledger omitted; zero duration omitted;
-  // empty when{} present as {} per shape definition.
+  // Default rule name omitted; Full ledger omitted; empty when{} present as {}
+  // per shape definition.
   REQUIRE(j.find("\"name\"") == std::string::npos);
   REQUIRE(j.find("\"ledger\"") == std::string::npos);
-  REQUIRE(j.find("\"duration_us\"") == std::string::npos);
   REQUIRE(j.find("\"when\":{}") != std::string::npos);
-  REQUIRE(j.find("\"kind\":\"blackhole\"") != std::string::npos);
+  REQUIRE(j.find("\"kind\":\"fragment\"") != std::string::npos);
 }
 
 TEST_CASE("scenario error carries nonzero line for inline errors", "[loki_config]") {

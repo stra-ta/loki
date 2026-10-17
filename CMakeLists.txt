@@ -41,7 +41,7 @@ if(BUILD_TESTING)
   FetchContent_MakeAvailable(Catch2)
 endif()
 
-foreach(d util config transport scheduler faults evidence replay control reactor)
+foreach(d util config transport scheduler faults evidence replay reactor)
   add_subdirectory("src/${d}")
 endforeach()
 add_subdirectory(src/cli)

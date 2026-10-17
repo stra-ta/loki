@@ -22,44 +22,13 @@ struct ActDeliver {
   std::uint64_t logical_offset = 0;     // pristine offset for evidence
 };
 
-// shutdown(SHUT_WR) on one leg; the peer on that leg sees FIN.
-struct ActFin {
-  ConnId conn;
-  LegSide leg;
-};
-
-// shutdown(SHUT_RD) on one leg; further reads from that leg are suppressed.
-struct ActHalfCloseRx {
-  ConnId conn;
-  LegSide leg;
-};
-
-// RST both legs and tear the connection down immediately.
-struct ActReset {
-  ConnId conn;
-};
-
 // Release a full reorder window (engine-managed state machine).
 struct ActFlushReorder { StreamKey key; };
 
-// Flush coalescing accumulator (engine-managed state machine).
-struct ActFlushCoalesce { StreamKey key; };
-
-// Begin (or resume) the upstream connect for this connection.
+// Begin the upstream connect for this connection.
 struct ActConnectUpstream { ConnId conn; };
 
-// Close downstream without ever connecting upstream.
-struct ActRefuseDownstream { ConnId conn; };
-
-// Resume accepting after accept_stall.
-struct ActResumeListener {};
-
-// Idle deadline reached; engine decides reset vs fin from rule params.
-struct ActIdleFire { ConnId conn; };
-
-using ScheduledAction = std::variant<ActDeliver, ActFin, ActHalfCloseRx, ActReset,
-                                     ActFlushReorder, ActFlushCoalesce, ActConnectUpstream,
-                                     ActRefuseDownstream, ActResumeListener, ActIdleFire>;
+using ScheduledAction = std::variant<ActDeliver, ActFlushReorder, ActConnectUpstream>;
 
 class Scheduler {
  public:

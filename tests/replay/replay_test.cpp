@@ -99,7 +99,7 @@ TEST_CASE("loader parses happy-path events.jsonl with manifest", "[replay]") {
                                      }()))
           .dump();
   const std::string line2 =
-      decision_to_json(make_decision(2, 2, Dir::AtoB, 40, FaultKind::Reset,
+      decision_to_json(make_decision(2, 2, Dir::AtoB, 40, FaultKind::Corrupt,
                                      json::Value::object()))
           .dump();
   write_file(dir + "/events.jsonl", "\n" + line1 + "\n\n" + line2 + "\n");
@@ -107,7 +107,7 @@ TEST_CASE("loader parses happy-path events.jsonl with manifest", "[replay]") {
   LoadedLedger l = load_events_jsonl(dir + "/events.jsonl", "", false);
   REQUIRE(l.decisions.size() == 2);  // empty lines skipped
   CHECK(l.decisions[0].kind == FaultKind::Latency);
-  CHECK(l.decisions[1].kind == FaultKind::Reset);
+  CHECK(l.decisions[1].kind == FaultKind::Corrupt);
   CHECK(l.scenario_hash_hex == "abcd1234");
   CHECK(l.seed == 99);
 
@@ -244,58 +244,3 @@ TEST_CASE("LedgerEngine fragments per resolved sizes array", "[replay]") {
   CHECK(r.pieces[1].logical_offset == 3);
 }
 
-TEST_CASE("LedgerEngine blackhole discard yields empty pieces in window", "[replay]") {
-  CompiledScenario sc;
-  LoadedLedger l;
-  json::Value bh = json::Value::object();
-  bh.set("duration_us", json::Value::u(1000));
-  bh.set("window_bytes", json::Value::u(20));
-  bh.set("mode", json::Value::str("discard"));
-  l.decisions.push_back(make_decision(1, 1, Dir::AtoB, 0, FaultKind::Blackhole, bh));
-
-  auto engine = make_ledger_engine(sc, l, {});
-  Scheduler sched;
-  engine->bind(&sched, 0);
-
-  StreamStats stats;
-  ProcessResult dropped = engine->process_read({1, Dir::AtoB}, 0, bytes_of("aaa"), stats, 10);
-  CHECK(dropped.pieces.empty());
-
-  // After the window expires traffic flows again.
-  ProcessResult after = engine->process_read({1, Dir::AtoB}, 20, bytes_of("bbb"), stats, 2000);
-  REQUIRE(after.pieces.size() == 1);
-  CHECK(text_of(after.pieces[0]) == "bbb");
-}
-
-TEST_CASE("LedgerEngine queues lifecycle actions on the scheduler", "[replay]") {
-  CompiledScenario sc;
-  LoadedLedger l;
-
-  json::Value rst = json::Value::object();
-  rst.set("after_us", json::Value::u(50));
-  l.decisions.push_back(make_decision(1, 9, Dir::AtoB, 0, FaultKind::Reset, rst));
-
-  json::Value fin = json::Value::object();
-  fin.set("side", json::Value::str("client"));
-  l.decisions.push_back(make_decision(2, 9, Dir::AtoB, 0, FaultKind::Fin, fin));
-
-  auto engine = make_ledger_engine(sc, l, {});
-  Scheduler sched;
-  engine->bind(&sched, 0);
-  engine->on_connection_accepted(9, 0);
-
-  StreamStats stats;
-  (void)engine->process_read({9, Dir::AtoB}, 0, bytes_of("x"), stats, 100);
-
-  std::vector<Scheduler::Due> due;
-  sched.pop_due(200, due);
-  int resets = 0, fins = 0, connects = 0;
-  for (const auto& d : due) {
-    if (std::holds_alternative<ActReset>(d.action)) ++resets;
-    if (std::holds_alternative<ActFin>(d.action)) ++fins;
-    if (std::holds_alternative<ActConnectUpstream>(d.action)) ++connects;
-  }
-  CHECK(resets == 1);
-  CHECK(fins == 1);
-  CHECK(connects == 1);  // accept contract: exactly one connect action
-}

@@ -33,9 +33,6 @@ struct StreamState {
   std::size_t cursor = 0;                    // next unconsumed decision index
   std::vector<OutPiece> reorder_held;        // held pieces awaiting window flush
   bool reorder_flush_scheduled = false;
-  bool freeze_active = false;                // freeze-mode blackhole in effect
-  TimeUs blackhole_until_time = 0;           // 0 = no active window
-  std::uint64_t blackhole_until_offset = 0;  // pristine offsets < this are dropped
 };
 
 class ReplayEngine final : public INetworkMutator, public LedgerEngine {
@@ -101,12 +98,6 @@ class ReplayEngine final : public INetworkMutator, public LedgerEngine {
       return passthrough(chunk_logical_offset, data);
     }
 
-    // Active blackhole window swallows the whole chunk.
-    if (st.blackhole_until_time != 0 && now <= st.blackhole_until_time &&
-        chunk_logical_offset < st.blackhole_until_offset) {
-      return result;  // empty piece set: discarded
-    }
-
     // Start with one piece covering the whole chunk.
     std::vector<OutPiece> pieces;
     OutPiece whole;
@@ -122,8 +113,8 @@ class ReplayEngine final : public INetworkMutator, public LedgerEngine {
   }
 
   void on_connection_accepted(ConnId conn, TimeUs now) override {
-    // Replay contract: exactly one connect/refuse action per accepted
-    // connection. Immediate upstream unless a ledger decision defers it.
+    // Replay contract: exactly one connect action per accepted connection.
+    // Immediate upstream unless a ledger decision defers it.
     scheduler_->push(now, ActConnectUpstream{conn});
   }
 
@@ -135,41 +126,8 @@ class ReplayEngine final : public INetworkMutator, public LedgerEngine {
       if (k.conn == conn) {
         st.reorder_held.clear();
         st.reorder_flush_scheduled = false;
-        st.blackhole_until_time = 0;
-        st.freeze_active = false;
       }
     }
-  }
-
-  void on_data_flushed(const StreamKey&, std::uint64_t, TimeUs) override {}
-
-  bool read_enabled(const StreamKey& key, TimeUs now) override {
-    auto it = streams_.find(key);
-    if (it == streams_.end()) return true;
-    // Freeze-mode blackhole stops reading the source leg during its window.
-    if (it->second.freeze_active && now <= it->second.blackhole_until_time) return false;
-    return true;
-  }
-
-  bool listener_enabled(TimeUs) override { return listener_enabled_; }
-
-  void set_decision_sink(DecisionSink sink) override { sink_ = std::move(sink); }
-
-  const std::vector<FaultDecision>& lifecycle_decisions() const override { return none_; }
-
-  bool manual_action(ManualAction action, ConnId conn, TimeUs now) override {
-    switch (action) {
-      case ManualAction::Pause:
-        listener_enabled_ = false;
-        return true;
-      case ManualAction::Resume:
-        listener_enabled_ = true;
-        return true;
-      case ManualAction::InjectReset:
-        scheduler_->push(now, ActReset{conn});
-        return true;
-    }
-    return false;
   }
 
   ProcessResult on_engine_timer(const ScheduledAction& origin, TimeUs now) override {
@@ -294,20 +252,6 @@ class ReplayEngine final : public INetworkMutator, public LedgerEngine {
         }
         break;
       }
-      case FaultKind::Blackhole: {
-        const std::uint64_t duration = get_u64(p, "duration_us");
-        st.blackhole_until_offset = d.stream_offset + get_u64(p, "window_bytes", ~0ull >> 1);
-        st.blackhole_until_time = duration == 0 ? Scheduler::kTimeMaxSentinel / 2
-                                                : now + static_cast<TimeUs>(duration);
-        const json::Value* mode = p.find("mode");
-        if (mode != nullptr && mode->type() == json::Value::Type::String &&
-            mode->as_str() == "freeze") {
-          st.freeze_active = true;
-        } else {
-          pieces.clear();  // discard mode: chunk consumed and dropped
-        }
-        break;
-      }
       case FaultKind::Fragment: {
         const json::Value* sizes = p.find("sizes");
         if (sizes == nullptr || sizes->type() != json::Value::Type::Array ||
@@ -360,56 +304,7 @@ class ReplayEngine final : public INetworkMutator, public LedgerEngine {
         }
         break;
       }
-      case FaultKind::Coalesce:
-        // Coalesce decisions carry resolved trigger info only; replay keeps
-        // bytes intact and relies on ActFlushCoalesce timers from the live
-        // engine. Recorded coalesce windows pass through unchanged here.
-        break;
-      // Lifecycle faults: push the corresponding scheduled action.
-      case FaultKind::Reset:
-        scheduler_->push(now + static_cast<TimeUs>(get_u64(p, "after_us")), ActReset{d.conn});
-        break;
-      case FaultKind::Fin:
-        scheduler_->push(now, ActFin{d.conn, leg_of(d)});
-        break;
-      case FaultKind::HalfClose: {
-        bool rx = false;
-        if (const json::Value* m = p.find("mode");
-            m != nullptr && m->type() == json::Value::Type::String && m->as_str() == "rx") {
-          rx = true;
-        }
-        if (rx) {
-          scheduler_->push(now, ActHalfCloseRx{d.conn, leg_of(d)});
-        } else {
-          scheduler_->push(now, ActFin{d.conn, leg_of(d)});
-        }
-        break;
-      }
-      case FaultKind::ConnectDelay:
-        // Replace the immediate connect scheduled at accept with a delayed one.
-        scheduler_->push(now + static_cast<TimeUs>(get_u64(p, "delay_us")),
-                         ActConnectUpstream{d.conn});
-        break;
-      case FaultKind::Refuse:
-        scheduler_->push(now + static_cast<TimeUs>(get_u64(p, "after_us")),
-                         ActRefuseDownstream{d.conn});
-        break;
-      case FaultKind::AcceptStall:
-        listener_enabled_ = false;
-        scheduler_->push(now + static_cast<TimeUs>(get_u64(p, "stall_us")), ActResumeListener{});
-        break;
-      case FaultKind::IdleTimeout:
-        scheduler_->push(now + static_cast<TimeUs>(get_u64(p, "idle_us")), ActIdleFire{d.conn});
-        break;
     }
-  }
-
-  static LegSide leg_of(const FaultDecision& d) {
-    const json::Value* side = d.resolved.find("side");
-    if (side != nullptr && side->type() == json::Value::Type::String &&
-        side->as_str() == "client")
-      return LegSide::Down;
-    return LegSide::Up;
   }
 
   LedgerEngineOptions options_;
@@ -420,9 +315,6 @@ class ReplayEngine final : public INetworkMutator, public LedgerEngine {
   std::uint64_t total_decisions_ = 0;
   std::uint64_t consumed_total_ = 0;
   mutable Stats stats_{};
-  bool listener_enabled_ = true;
-  DecisionSink sink_;
-  std::vector<FaultDecision> none_;
 };
 
 }  // namespace

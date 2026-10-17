@@ -29,32 +29,13 @@ void Scheduler::pop_due(TimeUs now, std::vector<Due>& out) {
     if (auto* d = std::get_if<ActDeliver>(&e.action)) {
       conn = d->key.conn;
       references_conn = true;
-    } else if (auto* f = std::get_if<ActFin>(&e.action)) {
-      conn = f->conn;
-      references_conn = true;
-    } else if (auto* h = std::get_if<ActHalfCloseRx>(&e.action)) {
-      conn = h->conn;
-      references_conn = true;
-    } else if (auto* r = std::get_if<ActReset>(&e.action)) {
-      conn = r->conn;
-      references_conn = true;
     } else if (auto* fr = std::get_if<ActFlushReorder>(&e.action)) {
       conn = fr->key.conn;
-      references_conn = true;
-    } else if (auto* fc = std::get_if<ActFlushCoalesce>(&e.action)) {
-      conn = fc->key.conn;
       references_conn = true;
     } else if (auto* cu = std::get_if<ActConnectUpstream>(&e.action)) {
       conn = cu->conn;
       references_conn = true;
-    } else if (auto* rd = std::get_if<ActRefuseDownstream>(&e.action)) {
-      conn = rd->conn;
-      references_conn = true;
-    } else if (auto* id = std::get_if<ActIdleFire>(&e.action)) {
-      conn = id->conn;
-      references_conn = true;
     }
-    // ActResumeListener carries no connection and always survives.
     if (references_conn && dropped_.count(conn) != 0) continue;
     out.push_back(Due{e.deadline, e.seq, std::move(e.action)});
   }

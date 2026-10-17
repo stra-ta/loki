@@ -199,13 +199,6 @@ TEST_CASE("finish is idempotent", "[evidence]") {
   CHECK(summary_text.find("\"decisions\": 7") != std::string::npos);
 }
 
-TEST_CASE("control_socket_path sits inside the run dir", "[evidence]") {
-  const std::string root = make_temp_dir() + "/runs";
-  ManifestInfo info;
-  RunStore rs = RunStore::create(root, info, "", "{}");
-  CHECK(rs.control_socket_path() == rs.run_dir() + "/control.sock");
-}
-
 TEST_CASE("json parser accepts a valid corpus", "[json-parse]") {
   auto v = json::parse_json(R"({"a": [1, -2, 3], "b": {"c": null}, "d": true})");
   REQUIRE(v.type() == json::Value::Type::Object);

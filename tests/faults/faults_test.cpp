@@ -37,10 +37,7 @@ struct Harness {
   explicit Harness(const std::string& yaml, TimeUs epoch = 0)
       : sc(compile_scenario(yaml)), eng(make_live_fault_engine(sc)) {
     eng->bind(sch, epoch);
-    eng->set_decision_sink([this](FaultDecision d) { sink.push_back(std::move(d)); });
   }
-
-  std::vector<FaultDecision> sink;  // lifecycle decisions captured via set_decision_sink
 
   ProcessResult read(ConnId conn, Dir dir, std::uint64_t offset, const std::string& data,
                      TimeUs now, std::uint64_t chunks_before = 0) {
@@ -122,45 +119,6 @@ TEST_CASE("fragment splits byte-exact with order preserved and sizes recorded", 
   for (std::size_t i = 0; i < r.pieces.size(); ++i) {
     CHECK(as_string(r2.pieces[i].payload) == as_string(r.pieces[i].payload));
   }
-}
-
-TEST_CASE("coalesce merges until size trigger then emits one piece", "[faults]") {
-  Harness h(with_rule(R"(
-  - name: coal
-    inject:
-      coalesce:
-        size: 10
-        max_delay: 1ms
-)"));
-  auto r1 = h.read(1, Dir::AtoB, 0, "12345", 10);
-  CHECK(r1.pieces.empty());  // held
-  auto r2 = h.read(1, Dir::AtoB, 5, "67890", 20);
-  REQUIRE(r2.pieces.size() == 1);
-  CHECK(as_string(r2.pieces[0].payload) == "1234567890");
-  CHECK(r2.pieces[0].logical_offset == 0);  // first held byte offset
-  CHECK(!r2.decisions.empty());
-}
-
-TEST_CASE("coalesce safety flush fires via ActFlushCoalesce timer", "[faults]") {
-  Harness h(with_rule(R"(
-  - name: coal
-    inject:
-      coalesce:
-        size: 100
-        max_delay: 500us
-)"));
-  auto r1 = h.read(1, Dir::AtoB, 0, "abc", 100);
-  CHECK(r1.pieces.empty());
-  auto fired = due(*h.sch, 600);
-  bool found = false;
-  for (auto& f : fired) {
-    if (std::get_if<ActFlushCoalesce>(&f.action)) found = true;
-  }
-  CHECK(found);
-  auto r2 = h.eng->on_engine_timer(fired[0].action, 600);
-  REQUIRE(r2.pieces.size() == 1);
-  CHECK(as_string(r2.pieces[0].payload) == "abc");
-  CHECK(r2.pieces[0].logical_offset == 0);
 }
 
 TEST_CASE("reorder depth-2 releases a valid permutation of two pieces", "[faults]") {
@@ -364,216 +322,6 @@ TEST_CASE("corrupt xor, overwrite, and applied=false miss", "[faults]") {
   CHECK_FALSE(rm.decisions[0].applied);
 }
 
-TEST_CASE("blackhole discard drops activation and later chunks, decision only at activation", "[faults]") {
-  Harness h(with_rule(R"(
-  - name: bh
-    when:
-      direction: b_to_a
-      max_occurrences: 1
-    inject:
-      blackhole:
-        direction: b_to_a
-        mode: discard
-        duration: 1ms
-)"));
-  // Discard semantics: chunks are consumed from the first byte of the
-  // window onward, including the chunk that activates it.
-  auto act = h.read(1, Dir::BtoA, 0, "first", 0);
-  CHECK(act.pieces.empty());
-  REQUIRE(act.decisions.size() == 1);
-  CHECK(act.decisions[0].kind == FaultKind::Blackhole);
-  CHECK(act.decisions[0].resolved.find("mode")->as_str() == "discard");
-  CHECK(act.decisions[0].resolved.find("duration_us")->as_int() == 1000);
-
-  auto dropped = h.read(1, Dir::BtoA, 5, "gone", 10);
-  CHECK(dropped.pieces.empty());
-  CHECK(dropped.decisions.empty());
-
-  // Other direction unaffected; window expires after duration.
-  auto other = h.read(1, Dir::AtoB, 0, "ok", 10);
-  CHECK(other.pieces.size() == 1);
-  auto after = h.read(1, Dir::BtoA, 5, "back", 5000);
-  CHECK(after.pieces.size() == 1);
-}
-
-TEST_CASE("blackhole freeze toggles read_enabled around expiry", "[faults]") {
-  Harness h(with_rule(R"(
-  - name: bf
-    inject:
-      blackhole:
-        direction: client_to_server
-        mode: freeze
-        duration: 2ms
-)"));
-  h.read(1, Dir::AtoB, 0, "x", 0);
-  CHECK_FALSE(h.eng->read_enabled(StreamKey{1, Dir::AtoB}, 1999));
-  CHECK(h.eng->read_enabled(StreamKey{1, Dir::AtoB}, 2000));  // time-based re-enable
-  CHECK(h.eng->read_enabled(StreamKey{1, Dir::BtoA}, 100));   // other flow unaffected
-}
-
-TEST_CASE("reset schedules ActReset after its delay", "[faults]") {
-  Harness h(with_rule(R"(
-  - name: rst
-    inject:
-      reset:
-        after: 250us
-)"));
-  auto r = h.read(3, Dir::AtoB, 0, "x", 100);
-  REQUIRE(r.decisions.size() == 1);
-  CHECK(r.decisions[0].kind == FaultKind::Reset);
-  CHECK(r.decisions[0].resolved.find("after_us")->as_int() == 250);
-  auto fired = due(*h.sch, 350);
-  REQUIRE(fired.size() == 1);
-  REQUIRE(std::get_if<ActReset>(&fired[0].action) != nullptr);
-  CHECK(std::get<ActReset>(fired[0].action).conn == 3);
-}
-
-TEST_CASE("fin and half_close map sides to legs correctly", "[faults]") {
-  Harness hf(with_rule(R"(
-  - name: finc
-    inject:
-      fin:
-        side: server
-)"));
-  auto rf = hf.read(1, Dir::AtoB, 0, "x", 0);
-  REQUIRE(rf.decisions.size() == 1);  // chunk-fault decision, not lifecycle
-  CHECK(rf.decisions[0].resolved.find("side")->as_str() == "server");
-  CHECK(rf.decisions[0].resolved.find("mode")->as_str() == "tx");
-  auto f = due(*hf.sch, 0);
-  REQUIRE(f.size() == 1);
-  auto* fin = std::get_if<ActFin>(&f[0].action);
-  REQUIRE(fin != nullptr);
-  CHECK(fin->leg == LegSide::Up);  // server side == Up
-  CHECK(fin->conn == 1);
-  CHECK(hf.sink.empty());  // fin via chunk read is a ProcessResult decision
-
-  // half_close rx on client side -> ActHalfCloseRx{Down}
-  Harness hr(with_rule(R"(
-  - name: hc
-    inject:
-      half_close:
-        side: client
-        mode: rx
-)"));
-  auto rh = hr.read(2, Dir::BtoA, 0, "y", 0);
-  CHECK(rh.decisions.size() == 1);
-  auto g = due(*hr.sch, 0);
-  REQUIRE(g.size() == 1);
-  auto* rx = std::get_if<ActHalfCloseRx>(&g[0].action);
-  REQUIRE(rx != nullptr);
-  CHECK(rx->leg == LegSide::Down);  // client side == Down
-}
-
-TEST_CASE("connect lifecycle schedules exactly one connect or refuse", "[faults]") {
-  SECTION("no rule matches: immediate upstream connect") {
-    Harness h(kBase);
-    h.eng->on_connection_accepted(1, 100);
-    auto f = due(*h.sch, 100);
-    REQUIRE(f.size() == 1);
-    REQUIRE(std::get_if<ActConnectUpstream>(&f[0].action) != nullptr);
-  }
-  SECTION("connect_delay defers the upstream connect") {
-    Harness h(with_rule(R"(
-  - name: cd
-    inject:
-      connect_delay:
-        delay: 5ms
-)"));
-    h.eng->on_connection_accepted(2, 1000);
-    auto f = due(*h.sch, 1000 + 5000);
-    REQUIRE(f.size() == 1);
-    REQUIRE(std::get_if<ActConnectUpstream>(&f[0].action) != nullptr);
-    REQUIRE(h.sink.size() == 1);
-    CHECK(h.sink[0].kind == FaultKind::ConnectDelay);
-    CHECK(h.sink[0].resolved.find("delay_us")->as_int() == 5000);
-  }
-  SECTION("refuse closes downstream without upstream") {
-    Harness h(with_rule(R"(
-  - name: rf
-    inject:
-      refuse:
-        after: 1ms
-)"));
-    h.eng->on_connection_accepted(4, 0);
-    auto f = due(*h.sch, 1000);
-    REQUIRE(f.size() == 1);
-    REQUIRE(std::get_if<ActRefuseDownstream>(&f[0].action) != nullptr);
-  }
-}
-
-TEST_CASE("accept_stall disables listener until expiry", "[faults]") {
-  Harness h(with_rule(R"(
-  - name: st
-    inject:
-      accept_stall:
-        stall: 3ms
-)"));
-  h.eng->on_connection_accepted(1, 0);
-  CHECK_FALSE(h.eng->listener_enabled(2999));
-  CHECK(h.eng->listener_enabled(3000));
-}
-
-TEST_CASE("idle timeout arms, re-arms, and fires reset and fin actions", "[faults]") {
-  const std::string yaml = with_rule(R"(
-  - name: idle
-    inject:
-      idle_timeout:
-        idle: 1ms
-        action: reset
-)");
-  Harness h(yaml);
-  h.read(1, Dir::AtoB, 0, "a", 0);       // arm @1000
-  h.read(1, Dir::AtoB, 1, "b", 400);     // re-arm @1400
-  // The @1000 timer surfaces at 1300 but must NOT fire (real deadline 1400);
-  // the engine returns empty and re-schedules.
-  auto stale = due(*h.sch, 1300);
-  for (const auto& s : stale) {
-    if (std::get_if<ActIdleFire>(&s.action)) {
-      auto nothing = h.eng->on_engine_timer(s.action, 1300);
-      CHECK(nothing.pieces.empty());
-    }
-  }
-  CHECK(due(*h.sch, 1399).empty());       // no reset before deadline
-  CHECK(h.sink.empty());
-  auto f = due(*h.sch, 1400);
-  REQUIRE(f.size() == 1);
-  auto res = h.eng->on_engine_timer(f[0].action, 1400);
-  CHECK(res.pieces.empty());
-  auto fired_reset = due(*h.sch, 1400);
-  REQUIRE(fired_reset.size() == 1);
-  REQUIRE(std::get_if<ActReset>(&fired_reset[0].action) != nullptr);
-  REQUIRE(h.sink.size() == 1);
-  CHECK(h.sink[0].kind == FaultKind::IdleTimeout);
-  CHECK(h.sink[0].applied);
-  CHECK(h.sink[0].resolved.find("idle_us")->as_int() == 1000);
-  CHECK(h.sink[0].resolved.find("action")->as_str() == "reset");
-
-  SECTION("fin action pushes FIN toward both legs") {
-    Harness hf(with_rule(R"(
-  - name: idlef
-    inject:
-      idle_timeout:
-        idle: 1ms
-        action: fin
-)"));
-    hf.read(9, Dir::AtoB, 0, "a", 0);
-    auto ff = due(*hf.sch, 1000);
-    REQUIRE(ff.size() == 1);
-    hf.eng->on_engine_timer(ff[0].action, 1000);
-    auto acts = due(*hf.sch, 1000);
-    REQUIRE(acts.size() == 2);
-    int downs = 0, ups = 0;
-    for (const auto& a : acts) {
-      const auto* fin = std::get_if<ActFin>(&a.action);
-      REQUIRE(fin != nullptr);
-      if (fin->leg == LegSide::Down) ++downs;
-      if (fin->leg == LegSide::Up) ++ups;
-    }
-    CHECK(downs == 1);
-    CHECK(ups == 1);
-  }
-}
-
 TEST_CASE("probability draws only after deterministic guards pass", "[faults]") {
   // Engine A: guard always fails (after: 1h), then fragment rule.
   // Engine B: fragment rule alone. A must match B exactly (no draw consumed).
@@ -634,14 +382,14 @@ TEST_CASE("max_occurrences caps total firings per rule", "[faults]") {
         count: 2
 )"));
   for (int i = 0; i < 5; ++i) {
-    auto r = h.read(1, Dir::AtoB, i * 2, "xy", i * 10);
+    auto r = h.read(1, Dir::AtoB, static_cast<std::uint64_t>(i * 2), "xy",
+                    static_cast<TimeUs>(i * 10));
     if (i < 2) {
       CHECK(r.pieces.size() == 2);
     } else {
       CHECK(r.pieces.size() == 1);
     }
   }
-  CHECK(h.sink.empty());  // process_read decisions are not lifecycle decisions
 }
 
 TEST_CASE("every_bytes fires once per crossing of a new multiple", "[faults]") {
@@ -675,7 +423,8 @@ TEST_CASE("every_events fires once per chunk-count multiple", "[faults]") {
 )"));
   int fires = 0;
   for (int i = 0; i < 7; ++i) {
-    auto r = h.read(1, Dir::AtoB, i, "x", 0, static_cast<std::uint64_t>(i));
+    auto r = h.read(1, Dir::AtoB, static_cast<std::uint64_t>(i), "x", 0,
+                    static_cast<std::uint64_t>(i));
     if (r.pieces.size() == 2) ++fires;
   }
   CHECK(fires == 2);  // events 3 and 6
@@ -724,40 +473,26 @@ TEST_CASE("min_stream_offset and after guards gate matching", "[faults]") {
   CHECK(h.read(1, Dir::AtoB, 60, "x", 100).pieces.size() == 2);  // passes
 }
 
-TEST_CASE("manual pause/resume and InjectReset behave per spec", "[faults]") {
-  Harness h(kBase);
-  CHECK(h.eng->manual_action(ManualAction::Pause, 0, 0));
-  CHECK_FALSE(h.eng->listener_enabled(1000));
-  CHECK(h.eng->manual_action(ManualAction::Resume, 0, 1000));
-  CHECK(h.eng->listener_enabled(1000));
-
-  CHECK(h.eng->manual_action(ManualAction::InjectReset, 5, 77));
-  auto f = due(*h.sch, 77);
-  REQUIRE(f.size() == 1);
-  const auto* rst = std::get_if<ActReset>(&f[0].action);
-  REQUIRE(rst != nullptr);
-  CHECK(rst->conn == 5);
-  REQUIRE(h.sink.size() == 1);
-  CHECK(h.sink[0].rule_name == "manual-ctl");
-  CHECK(h.sink[0].kind == FaultKind::Reset);
-  CHECK(h.sink[0].applied);
-  CHECK(h.sink[0].stream_offset == 0);
-  CHECK(h.sink[0].inputs.bytes_seen == 0);
-  CHECK(h.sink[0].inputs.elapsed_us == 0);
-  CHECK(h.sink[0].resolved.find("after_us")->as_int() == 0);
-}
-
 TEST_CASE("on_connection_closed cancels pending state", "[faults]") {
   Harness h(with_rule(R"(
-  - name: rst2
+  - name: hold2
     inject:
-      reset:
-        after: 1ms
+      reorder:
+        depth: 4
+        max_hold: 1ms
 )"));
-  h.read(4, Dir::AtoB, 0, "x", 0);
-  CHECK(h.sch->size() > 0);
-  h.eng->on_connection_closed(4, 10, ClosedReason::FaultReset);
-  CHECK(due(*h.sch, 5000).empty());  // tombstoned
+  auto held = h.read(4, Dir::AtoB, 0, "x", 0);
+  CHECK(held.pieces.empty());     // held by the reorder window
+  CHECK(h.sch->size() > 0);       // flush timer armed
+  h.eng->on_connection_closed(4, 10, ClosedReason::ServerClosed);
+  CHECK(due(*h.sch, 5000).empty());  // conn 4's flush was tombstoned
+  // Other connections keep working: conn 5 starts its own window and the
+  // held bytes release through the engine timer path.
+  auto held5 = h.read(5, Dir::AtoB, 0, "y", 20);
+  CHECK(held5.pieces.empty());
+  auto flushed = h.eng->on_engine_timer(ActFlushReorder{StreamKey{5, Dir::AtoB}}, 40);
+  CHECK(flushed.pieces.size() == 1);
+  CHECK(as_string(flushed.pieces[0].payload) == "y");
 }
 
 TEST_CASE("event_index is global and starts at 1 across decisions", "[faults]") {
@@ -777,8 +512,7 @@ TEST_CASE("event_index is global and starts at 1 across decisions", "[faults]") 
   CHECK(r.decisions[1].event_index == 2);
   // pieces: dup2 makes 2, dup3 triples them
   CHECK(r.pieces.size() == 6);
-  h.eng->on_connection_accepted(9, 0);  // default connect logs nothing here
-  CHECK(h.sink.empty());
+  h.eng->on_connection_accepted(9, 0);  // default connect schedules ActConnectUpstream only
 }
 
 TEST_CASE("full determinism: identical seed and script produce identical runs", "[faults]") {
@@ -810,8 +544,10 @@ TEST_CASE("full determinism: identical seed and script produce identical runs", 
     std::vector<std::string> trace;
     std::uint64_t off = 0;
     for (int i = 0; i < 10; ++i) {
-      const std::string data(i % 3 + 1, static_cast<char>('A' + i));
-      auto r = h.read(1, Dir::AtoB, off, data, i * 120, static_cast<std::uint64_t>(i));
+      const std::string data(static_cast<std::size_t>(i % 3 + 1),
+                             static_cast<char>('A' + i));
+      auto r = h.read(1, Dir::AtoB, off, data, static_cast<TimeUs>(i * 120),
+                      static_cast<std::uint64_t>(i));
       off += data.size();
       for (const auto& pc : r.pieces) {
         trace.push_back(as_string(pc.payload) + "@" + std::to_string(pc.logical_offset) +
@@ -824,9 +560,6 @@ TEST_CASE("full determinism: identical seed and script produce identical runs", 
       }
     }
     h.eng->on_connection_accepted(3, 5000);
-    for (const auto& d : h.sink) {
-      trace.push_back("L:" + std::to_string(d.event_index) + ":" + d.resolved.dump());
-    }
     return trace;
   };
 

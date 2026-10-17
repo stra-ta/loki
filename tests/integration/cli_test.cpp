@@ -329,13 +329,3 @@ TEST_CASE("inspect reports summaries, connections, and event tails", "[cli]") {
   CHECK(run_cli({"inspect", dir, "--tail", "5"}).exit_code == 2);
 }
 
-TEST_CASE("ctl against a dead socket exits 4", "[cli]") {
-  const fs::path dead = fs::temp_directory_path() / "loki-cli-test" / "dead.sock";
-  std::error_code ec;
-  fs::remove(dead, ec);
-  CHECK(run_cli({"ctl", dead.string(), "status"}).exit_code == 4);
-
-  const fs::path dir = fs::temp_directory_path() / "loki-cli-test" / "ctl-dir";
-  fs::create_directories(dir);
-  CHECK(run_cli({"ctl", dir.string(), "status"}).exit_code == 4);
-}

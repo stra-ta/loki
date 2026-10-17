@@ -10,7 +10,7 @@ limits:
   max_connections: 64
 
 rules:
-  - name: early-reset-guard
+  - name: chunk-shredder
     when:
       direction: client_to_server
     ledger: counts

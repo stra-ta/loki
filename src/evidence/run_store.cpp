@@ -161,7 +161,7 @@ FaultDecision decision_from_json(const json::Value& v) {
   std::string kind = require_str(v, "kind");
   // kind parsed back via the canonical names produced by kind_name().
   bool matched = false;
-  for (std::uint8_t k = 0; k <= static_cast<std::uint8_t>(FaultKind::IdleTimeout); ++k) {
+  for (std::uint8_t k = 0; k <= static_cast<std::uint8_t>(FaultKind::Corrupt); ++k) {
     auto fk = static_cast<FaultKind>(k);
     if (kind == kind_name(fk)) { d.kind = fk; matched = true; break; }
   }
@@ -283,10 +283,6 @@ RunStore& RunStore::operator=(RunStore&& other) noexcept {
 const std::string& RunStore::run_dir() const {
   static const std::string empty;
   return impl_ ? impl_->run_dir : empty;
-}
-
-std::string RunStore::control_socket_path() const {
-  return run_dir() + "/control.sock";
 }
 
 RunStore::EventLog& RunStore::events() { return event_log_; }

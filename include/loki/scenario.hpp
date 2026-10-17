@@ -9,12 +9,10 @@
 //
 // Composition order (INVARIANT, enforced by the fault engine):
 //   Rules are evaluated in ascending rule index against each freshly read
-//   chunk. Shape faults (corrupt, duplicate, fragment, coalesce, reorder)
-//   transform the current piece list. Timing faults (latency, bandwidth)
-//   stamp send deadlines on pieces; when several stamp the same piece the
-//   LATER deadline wins (never accelerates traffic). Lifecycle/silence faults
-//   (blackhole, reset, half_close, refuse, accept_stall, connect_delay,
-//   idle_timeout) queue side effects immediately.
+//   chunk. Shape faults (corrupt, duplicate, fragment, reorder) transform the
+//   current piece list. Timing faults (latency, bandwidth) stamp send
+//   deadlines on pieces; when several stamp the same piece the LATER deadline
+//   wins (never accelerates traffic).
 //
 // Offset invariant (INVARIANT):
 //   stream_offset values always refer to the PRISTINE logical byte stream of
@@ -43,18 +41,9 @@ enum class FaultKind : std::uint8_t {
   Latency,        // delay + jitter per piece
   Bandwidth,      // token-bucket throttle per direction
   Fragment,       // split pieces into random sizes, order preserved
-  Coalesce,       // accumulate pieces until size or max_delay trigger
   Reorder,        // buffer up to depth pieces, release permuted
   Duplicate,      // emit extra copies of every piece
   Corrupt,        // xor or overwrite one byte at an absolute stream offset
-  Blackhole,      // silence a direction: discard chunks or freeze reads
-  Reset,          // RST both legs after optional delay
-  Fin,            // graceful FIN toward one side (half_close tx sugar)
-  HalfClose,      // shutdown read or write side of one leg
-  ConnectDelay,   // defer upstream connect after accept
-  Refuse,         // close downstream without establishing upstream
-  AcceptStall,    // stop accepting for a duration
-  IdleTimeout     // reset or fin a connection idle for a duration
 };
 
 const char* kind_name(FaultKind k);   // "latency", "bandwidth", ...
@@ -76,11 +65,6 @@ struct FragmentParams {
   std::uint64_t max_bytes = 1;       // >= min_bytes
 };
 
-struct CoalesceParams {
-  std::uint64_t size_bytes = 1;      // flush trigger
-  std::uint64_t max_delay_us = 0;    // safety flush deadline from first held byte
-};
-
 struct ReorderParams {
   std::uint32_t depth = 2;           // >= 2; window size in pieces
   std::uint64_t max_hold_us = 1000;  // flush deadline from first held piece
@@ -97,47 +81,10 @@ struct CorruptParams {
   std::uint8_t value = 0;            // mask for xor / replacement byte for overwrite
 };
 
-struct BlackholeParams {
-  Dir dir = Dir::AtoB;               // which FLOW is silenced (direction of travel)
-  enum class Mode : std::uint8_t { Discard, Freeze } mode = Mode::Discard;
-  std::uint64_t duration_us = 0;     // 0 = rest of the run
-};
-
-struct ResetParams {
-  std::uint64_t after_us = 0;        // 0 = immediate
-};
-
-struct HalfCloseParams {
-  LegSide leg = LegSide::Up;         // whose write/read side closes
-  enum class Mode : std::uint8_t { Tx, Rx } mode = Mode::Tx;  // Tx peer sees FIN
-};
-
-struct ConnectDelayParams {
-  std::uint64_t delay_us = 0;
-};
-
-struct RefuseParams {
-  std::uint64_t after_us = 0;
-};
-
-struct AcceptStallParams {
-  std::uint64_t stall_us = 0;
-};
-
-struct IdleTimeoutParams {
-  std::uint64_t idle_us = 0;
-  enum class Action : std::uint8_t { Reset, Fin } action = Action::Reset;
-};
-
 using FaultParams = std::variant<LatencyParams, BandwidthParams, FragmentParams,
-                                 CoalesceParams, ReorderParams, DuplicateParams,
-                                 CorruptParams, BlackholeParams, ResetParams,
-                                 HalfCloseParams, ConnectDelayParams, RefuseParams,
-                                 AcceptStallParams, IdleTimeoutParams>;
+                                 ReorderParams, DuplicateParams, CorruptParams>;
 
 FaultKind kind_of(const FaultParams& p);
-
-// `fin` is schema sugar for half_close tx and maps to HalfCloseParams.
 
 // ---------------------------------------------------------------------------
 // Match conditions
@@ -157,7 +104,6 @@ struct MatchSpec {
   double probability = 1.0;          // [0,1]
   std::uint64_t max_occurrences = ~std::uint64_t{0};
   std::uint64_t min_stream_offset = 0;  // stream_offset >= guard
-  std::string sni;                   // TLS SNI (server_name) exact match; "" = any
 };
 
 // ---------------------------------------------------------------------------

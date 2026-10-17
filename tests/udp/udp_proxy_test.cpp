@@ -96,21 +96,10 @@ class PassthroughMutator final : public INetworkMutator {
   }
   void on_connection_established(ConnId, TimeUs) override {}
   void on_connection_closed(ConnId, TimeUs, ClosedReason) override {}
-  void on_data_flushed(const StreamKey&, std::uint64_t, TimeUs) override {}
-  bool read_enabled(const StreamKey&, TimeUs) override { return true; }
-  bool listener_enabled(TimeUs) override { return true; }
-  void set_decision_sink(DecisionSink sink) override { sink_ = std::move(sink); }
-  const std::vector<FaultDecision>& lifecycle_decisions() const override { return none_; }
-  bool manual_action(ManualAction action, ConnId conn, TimeUs now) override {
-    if (action == ManualAction::InjectReset) sched_->push(now, ActReset{conn});
-    return true;
-  }
   ProcessResult on_engine_timer(const ScheduledAction&, TimeUs) override { return {}; }
 
  private:
   Scheduler* sched_ = nullptr;
-  DecisionSink sink_;
-  std::vector<FaultDecision> none_;
 };
 
 // Read the lone run's events.jsonl produced under runs_root (the test wipes the
@@ -134,20 +123,6 @@ bool events_have_kind(const std::string& runs_root, const std::string& kind) {
   return read_events_jsonl(runs_root).find(needle) != std::string::npos;
 }
 
-std::size_t connection_record_count(const std::string& runs_root) {
-  namespace fs = std::filesystem;
-  for (const auto& e : fs::directory_iterator(runs_root)) {
-    if (!e.is_directory()) continue;
-    std::ifstream f((e.path() / "connections.jsonl").string());
-    std::size_t count = 0;
-    std::string line;
-    while (std::getline(f, line)) {
-      if (!line.empty()) ++count;
-    }
-    return count;
-  }
-  return 0;
-}
 
 bool receive_udp_datagram(int fd, std::vector<std::byte>& out,
                           std::chrono::steady_clock::time_point deadline) {
@@ -676,164 +651,3 @@ TEST_CASE("udp echoes a large datagram intact", "[udp]") {
   ::close(cfd);
 }
 
-TEST_CASE("udp idle_timeout tears down a mapping and logs the decision", "[udp]") {
-  const Endpoint listen_ep = pick_udp_port();
-  const int echo_fd = sock::udp_bind(Endpoint{"127.0.0.1", 0});
-  const std::uint16_t echo_port = sock::local_port(echo_fd);
-  REQUIRE(echo_port != 0);
-  std::atomic<bool> echo_stop{false};
-  std::thread echo_thread(run_udp_echo, echo_fd, &echo_stop);
-
-  const std::string yaml =
-      "version: 1\n"
-      "seed: 5\n"
-      "listen: " + listen_ep.to_string() + "\n" +
-      "upstream: 127.0.0.1:" + std::to_string(echo_port) + "\n" +
-      "rules:\n"
-      "  - name: idle\n"
-      "    inject:\n"
-      "      idle_timeout:\n"
-      "        idle: 10ms\n"
-      "        action: reset\n";
-  CompiledScenario sc = compile_scenario(yaml);
-
-  ReactorConfig cfg;
-  cfg.scenario = sc;
-  cfg.runs_root = "/tmp/loki-udp-test-idle";
-  cfg.transport = TransportMode::Udp;
-  std::filesystem::remove_all(cfg.runs_root);
-
-  std::atomic<bool> proxy_failed{false};
-  std::thread proxy_thread([&]() {
-    MutatorFactory factory = [](const CompiledScenario& scenario, Scheduler& sched,
-                                TimeUs epoch) -> std::unique_ptr<INetworkMutator> {
-      auto engine = make_live_fault_engine(scenario);
-      engine->bind(&sched, epoch);
-      return engine;
-    };
-    try {
-      run_proxy(cfg, factory);
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "udp idle run failed: %s\n", e.what());
-      proxy_failed.store(true);
-    }
-  });
-
-  const int cfd = sock::udp_connect(listen_ep);
-  REQUIRE(cfd >= 0);
-  constexpr std::size_t kLen = 32;
-  std::vector<std::byte> sent(kLen, static_cast<std::byte>(0x55));
-
-  // One exchange to open the mapping, then go silent past the idle threshold.
-  std::vector<std::byte> got(kLen);
-  std::size_t got_n = 0;
-  auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-  while (got_n < kLen && std::chrono::steady_clock::now() < dl) {
-    sock::write_some(cfd, sent.data(), kLen);
-    struct pollfd pfd{cfd, POLLIN, 0};
-    if (::poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
-      sock::IoResult r = sock::read_some(cfd, got.data() + got_n, kLen - got_n);
-      if (r.n > 0) got_n += static_cast<std::size_t>(r.n);
-    }
-  }
-  REQUIRE(got_n == kLen);
-  ::usleep(80000);  // > idle threshold; the engine should fire idle_timeout
-
-  REQUIRE(::kill(::getpid(), SIGINT) == 0);
-  proxy_thread.join();
-  CHECK(!proxy_failed.load());
-  CHECK(events_have_kind(cfg.runs_root, "idle_timeout"));
-
-  echo_stop.store(true);
-  echo_thread.join();
-  ::close(echo_fd);
-  ::close(cfd);
-}
-
-TEST_CASE("udp fan-in recreates many mappings after idle expiry", "[udp][stress]") {
-  const Endpoint listen_ep = pick_udp_port();
-  const int echo_fd = sock::udp_bind(Endpoint{"127.0.0.1", 0});
-  const std::uint16_t echo_port = sock::local_port(echo_fd);
-  REQUIRE(echo_port != 0);
-  std::atomic<bool> echo_stop{false};
-  std::thread echo_thread(run_udp_echo, echo_fd, &echo_stop);
-
-  const std::string yaml =
-      "version: 1\n"
-      "seed: 303\n"
-      "listen: " + listen_ep.to_string() + "\n" +
-      "upstream: 127.0.0.1:" + std::to_string(echo_port) + "\n" +
-      "limits:\n"
-      "  max_connections: 64\n"
-      "rules:\n"
-      "  - name: expire\n"
-      "    inject:\n"
-      "      idle_timeout:\n"
-      "        idle: 100ms\n"
-      "        action: reset\n";
-  CompiledScenario sc = compile_scenario(yaml);
-
-  ReactorConfig cfg;
-  cfg.scenario = sc;
-  cfg.runs_root = "/tmp/loki-udp-test-fan-in";
-  cfg.transport = TransportMode::Udp;
-  std::filesystem::remove_all(cfg.runs_root);
-
-  std::atomic<bool> proxy_failed{false};
-  std::thread proxy_thread([&]() {
-    MutatorFactory factory = [](const CompiledScenario& scenario, Scheduler& sched,
-                                TimeUs epoch) -> std::unique_ptr<INetworkMutator> {
-      auto engine = make_live_fault_engine(scenario);
-      engine->bind(&sched, epoch);
-      return engine;
-    };
-    try {
-      run_proxy(cfg, factory);
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "udp fan-in run failed: %s\n", e.what());
-      proxy_failed.store(true);
-    }
-  });
-
-  constexpr std::size_t kClients = 32;
-  std::vector<int> clients;
-  clients.reserve(kClients);
-  for (std::size_t i = 0; i < kClients; ++i) {
-    const int fd = sock::udp_connect(listen_ep);
-    REQUIRE(fd >= 0);
-    clients.push_back(fd);
-  }
-  // Give the reactor time to bind before creating the first mapping.
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-  auto round_trip = [&](std::uint8_t value) {
-    for (std::size_t i = 0; i < clients.size(); ++i) {
-      const std::byte sent = static_cast<std::byte>(value + i);
-      std::vector<std::byte> got;
-      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-      bool ok = false;
-      while (!ok && std::chrono::steady_clock::now() < deadline) {
-        sock::write_some(clients[i], &sent, 1);
-        if (receive_udp_datagram(clients[i], got, deadline)) {
-          ok = got.size() == 1 && got[0] == sent;
-        }
-      }
-      REQUIRE(ok);
-    }
-  };
-
-  round_trip(0x10);
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
-  round_trip(0x80);
-
-  REQUIRE(::kill(::getpid(), SIGINT) == 0);
-  proxy_thread.join();
-  CHECK(!proxy_failed.load());
-  // Every client should have one expired mapping and one recreated mapping.
-  CHECK(connection_record_count(cfg.runs_root) >= kClients * 2);
-
-  echo_stop.store(true);
-  echo_thread.join();
-  for (const int fd : clients) ::close(fd);
-  ::close(echo_fd);
-}

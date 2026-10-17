@@ -1,4 +1,4 @@
-// loki CLI: run / validate / replay / inspect / ctl.
+// loki CLI: run / validate / replay / inspect.
 //
 // Exit codes (INVARIANT): 0 ok, 2 usage error, 3 scenario validation failure,
 // 4 runtime failure, 5 replay mismatch.
@@ -19,7 +19,6 @@
 #include <thread>
 #include <vector>
 
-#include <loki/control.hpp>
 #include <loki/engine.hpp>
 #include <loki/evidence.hpp>
 #include <loki/json.hpp>
@@ -28,7 +27,6 @@
 #include <loki/replay.hpp>
 #include <loki/scenario.hpp>
 #include <loki/version.hpp>
-#include "../config/validate_transport.hpp"
 
 namespace fs = std::filesystem;
 
@@ -52,17 +50,12 @@ void print_usage(std::FILE* out) {
       "  loki validate SCENARIO.yaml\n"
       "  loki replay RUN_DIR [--check-only]\n"
       "  loki inspect RUN_DIR [--summary | --connections | --events --tail N]\n"
-      "  loki ctl RUN_DIR_OR_SOCK CMD [CONN]\n"
-      "\n"
-      "Commands for ctl: pause, resume, status, inject [CONN]\n"
       "\n"
       "Examples:\n"
       "  loki run scenarios/basic.yaml --seed 123\n"
       "  loki validate scenarios/basic.yaml\n"
       "  loki replay runs/run-20260101-000000-123\n"
-      "  loki inspect runs/run-20260101-000000-123 --events --tail 50\n"
-      "  loki ctl runs/run-20260101-000000-123 status\n"
-      "  loki ctl runs/run-20260101-000000-123 inject 17\n",
+      "  loki inspect runs/run-20260101-000000-123 --events --tail 50\n",
       LOKI_VERSION_STRING);
 }
 
@@ -258,7 +251,6 @@ int cmd_run(const std::vector<std::string>& args) {
   const std::string yaml_text = read_file_or_exit(scenario_path, kExitValidation);
   CompiledScenario sc = compile_from_text(yaml_text, scenario_path);
   try {
-    check_transport_compat(sc, transport);
   } catch (const ScenarioError& e) {
     std::fprintf(stderr, "loki: %s: validation error%s%s: %s\n", scenario_path.c_str(),
                  e.line > 0 ? " at line " : "",
@@ -385,7 +377,6 @@ int cmd_replay(const std::vector<std::string>& args) {
       read_file_or_exit(fs::path(run_dir) / "scenario.yaml", kExitRuntime);
   CompiledScenario sc = compile_from_text(yaml_text, fs::path(run_dir) / "scenario.yaml");
   try {
-    check_transport_compat(sc, transport);
   } catch (const ScenarioError& e) {
     std::fprintf(stderr, "loki: replay: validation error%s%s: %s\n",
                  e.line > 0 ? " at line " : "",
@@ -452,20 +443,6 @@ int cmd_replay(const std::vector<std::string>& args) {
     }
     void on_connection_closed(ConnId c, TimeUs now, ClosedReason r) override {
       inner_->on_connection_closed(c, now, r);
-    }
-    void on_data_flushed(const StreamKey& k, std::uint64_t b, TimeUs now) override {
-      inner_->on_data_flushed(k, b, now);
-    }
-    bool read_enabled(const StreamKey& k, TimeUs now) override {
-      return inner_->read_enabled(k, now);
-    }
-    bool listener_enabled(TimeUs now) override { return inner_->listener_enabled(now); }
-    void set_decision_sink(DecisionSink sink) override { inner_->set_decision_sink(std::move(sink)); }
-    const std::vector<FaultDecision>& lifecycle_decisions() const override {
-      return inner_->lifecycle_decisions();
-    }
-    bool manual_action(ManualAction a, ConnId c, TimeUs now) override {
-      return inner_->manual_action(a, c, now);
     }
     ProcessResult on_engine_timer(const ScheduledAction& origin, TimeUs now) override {
       return inner_->on_engine_timer(origin, now);
@@ -611,118 +588,6 @@ int cmd_inspect(const std::vector<std::string>& args) {
 // ctl
 // ---------------------------------------------------------------------------
 
-int cmd_ctl(const std::vector<std::string>& args) {
-  std::string target, cmd_name, conn_arg;
-  size_t positionals = 0;
-  for (size_t i = 0; i < args.size(); ++i) {
-    const std::string& a = args[i];
-    if (!a.empty() && a[0] == '-') {
-      usage_error("unknown flag '" + a + "'");
-    }
-    switch (positionals++) {
-      case 0: target = a; break;
-      case 1: cmd_name = a; break;
-      case 2: conn_arg = a; break;
-      default: usage_error("unexpected argument '" + a + "'");
-    }
-  }
-  if (target.empty()) usage_error("ctl requires RUN_DIR_OR_SOCK");
-  if (cmd_name.empty()) usage_error("ctl requires CMD");
-  if (!conn_arg.empty()) {
-    std::uint64_t c = 0;
-    if (!parse_u64(conn_arg, &c)) usage_error("CONN must be a connection ordinal");
-  }
-
-  std::string request;
-  if (cmd_name == "pause") {
-request = "{\"cmd\":\"pause\"}";
-  } else if (cmd_name == "resume") {
-request = "{\"cmd\":\"resume\"}";
-  } else if (cmd_name == "status") {
-request = "{\"cmd\":\"status\"}";
-  } else if (cmd_name == "inject" || cmd_name == "reset" || cmd_name == "inject-reset") {
-request = conn_arg.empty() ? "{\"cmd\":\"inject\",\"fault\":\"reset\"}"
-                               : "{\"cmd\":\"inject\",\"fault\":\"reset\",\"connection\":" +
-                                     conn_arg + "}";
-  } else {
-    usage_error("unknown ctl command '" + cmd_name + "' (expected pause|resume|status|inject)");
-  }
-
-  // Accept either the run directory or an explicit socket path.
-  fs::path sock_path(target);
-  std::error_code ec;
-  if (fs::is_directory(target, ec)) sock_path /= "control.sock";
-
-  // Validate locally before touching the socket.
-  try {
-    (void)parse_control_request(request);
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "loki: internal control request error: %s\n", e.what());
-    return kExitRuntime;
-  }
-
-  const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-  if (fd < 0) {
-    std::perror("loki: socket");
-    return kExitRuntime;
-  }
-  sockaddr_un addr{};
-  addr.sun_family = AF_UNIX;
-  const std::string sp = sock_path.string();
-  if (sp.size() >= sizeof(addr.sun_path)) {
-    std::fprintf(stderr, "loki: socket path too long: %s\n", sp.c_str());
-    ::close(fd);
-    return kExitRuntime;
-  }
-  std::strncpy(addr.sun_path, sp.c_str(), sizeof(addr.sun_path) - 1);
-
-  if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
-    std::fprintf(stderr, "loki: cannot connect to control socket %s: %s\n", sp.c_str(),
-                 std::strerror(errno));
-    ::close(fd);
-    return kExitRuntime;
-  }
-
-  const std::string line = request + "\n";
-  ssize_t off = 0;
-  while (off < static_cast<ssize_t>(line.size())) {
-    const ssize_t n = ::write(fd, line.data() + off, line.size() - static_cast<size_t>(off));
-    if (n <= 0) {
-      std::fprintf(stderr, "loki: control socket write failed: %s\n", std::strerror(errno));
-      ::close(fd);
-      return kExitRuntime;
-    }
-    off += n;
-  }
-  ::shutdown(fd, SHUT_WR);
-
-  std::string response;
-  char buf[4096];
-  ssize_t n;
-  while ((n = ::read(fd, buf, sizeof buf)) > 0) response.append(buf, static_cast<size_t>(n));
-  ::close(fd);
-
-  if (response.empty()) {
-    std::fprintf(stderr, "loki: no response from control socket %s\n", sp.c_str());
-    return kExitRuntime;
-  }
-  std::printf("%s\n", trim(response).c_str());
-
-  // Surface server-side errors via the runtime exit code.
-  try {
-    const json::Value v = json::parse_json(response);
-    if (const json::Value* ok = v.find("ok"); ok && !ok->as_bool()) {
-      if (const json::Value* err = v.find("error")) {
-        std::fprintf(stderr, "loki: ctl error: %s\n", err->as_str().c_str());
-      }
-      return kExitRuntime;
-    }
-  } catch (const std::exception&) {
-    // Non-JSON response still printed above; treat as success of transport.
-  }
-  return kExitOk;
-}
-
 }  // namespace
 }  // namespace loki
 
@@ -753,7 +618,6 @@ int main(int argc, char** argv) {
   }
   if (verb == "replay") return cmd_replay(expand_equals(args));
   if (verb == "inspect") return cmd_inspect(expand_equals(args));
-  if (verb == "ctl") return cmd_ctl(expand_equals(args));
 
-  usage_error("unknown verb '" + verb + "' (expected run|validate|replay|inspect|ctl)");
+  usage_error("unknown verb '" + verb + "' (expected run|validate|replay|inspect)");
 }

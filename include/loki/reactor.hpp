@@ -13,7 +13,6 @@
 //   4. Pop all due scheduler actions in (deadline, seq) order and execute.
 //   5. Backpressure: a direction with pending bytes >= limits stops reading
 //      its source socket (read arming off) until it drains below the bound.
-//   6. Control requests drain between steps 4 and 5.
 
 #include <functional>
 #include <map>
